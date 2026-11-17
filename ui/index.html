@@ -940,7 +940,7 @@ function applySettings(st){
   $('#lang').value = st.lang ?? 'zho';
   $('#title').value = st.title ?? 'Undefined';
   $('#jobs').value = st.jobs ?? 8;
-  $('#outdir').value = st.outdir ?? '';
+  $('#outdir').value = '';   // 输出目录不跟着上次跑：留空就是默认的 <字幕目录>/<字幕名>/
   $('#modRoot').value = st.mod_root ?? '';
   $('#w').value = st.width || '';
   $('#h').value = st.height || '';
@@ -982,6 +982,10 @@ function saveSettings(){
   clearTimeout(saveTimer);
   saveTimer = setTimeout(async () => {
     const o = readForm();
+    // outdir / ass 只是这一次的形式状态，不写进 state.json：
+    // 输出目录每次启动都回到默认（<字幕目录>/<字幕名>/），字幕也不自动带上，
+    // 否则上次（包括调试跑出来的）路径会一直黏在界面上。
+    delete o.outdir; delete o.ass;
     const res = await rpc('/api/settings', {settings:o});
     if (res.env){ S.env = res.env; S.modDir = res.mod_dir; renderEnv(); }
   }, 300);
