@@ -2,6 +2,9 @@
 /target/
 /dist/
 
+# 发布压缩包（pack-release.bat 生成）
+/release/
+
 # Tauri 构建时生成的 ACL schema
 /gen/schemas/
 
