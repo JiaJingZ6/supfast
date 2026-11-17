@@ -149,6 +149,34 @@ dist\supfast.exe
 期望看到：文件行「未选择文件 · 拖入 .ass 或 .ssa」、最近 0 条、历史 0 条、输出目录空、
 `开始转换` 灰色、切段计划「尚未分析」。
 
+### 发 Release
+
+发版由 GitHub Actions 完成：打 `v*` tag 时，`.github/workflows/release.yml` 把
+`packaging\artifacts\` 里的 zip 发成 Release，正文取 `packaging\release-notes-<版本>.md`。
+
+```bat
+:: 1. 出包（版本号在 pack-release.bat 顶部改）
+build.bat
+pack-release.bat
+
+:: 2. 放进版本库，只留这一个 zip（workflow 会检查数量必须为 1）
+del packaging\artifacts\*.zip
+copy release\supfast-<版本>-win64.zip packaging\artifacts\
+
+:: 3. 写一份 release 正文
+::    packaging\release-notes-<版本>.md
+
+:: 4. 提交 + 打 tag（tag 即触发发布）
+git add -A && git commit -m "release: <版本>"
+git push
+git tag -a v<版本> -m "supfast <版本>" && git push origin v<版本>
+```
+
+包里有 `mod\` 的二进制（`avs2bdnxml.exe`、`VSFilterMod.dll`），runner 上没法现编，
+所以 zip 随仓库走。它 3.1 MB，每个版本一份，记得删掉旧版本的那份。
+
+也可以在 Actions 页面用 `workflow_dispatch` 手动触发，填一个已存在的 tag。
+
 ## 调试钩子
 
 ```bat
