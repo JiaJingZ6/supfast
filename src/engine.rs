@@ -40,9 +40,6 @@ use std::time::Instant;
 // 常量
 // ---------------------------------------------------------------------------
 
-/// 版本号
-const VERSION: &str = "0.1.0";
-
 /// 静态段最少渲染帧数（1 帧会输出空事件）
 const MIN_STATIC_FRAMES: u32 = 2;
 /// 切段上限：逐段调用的固定开销会反噬
@@ -86,19 +83,6 @@ struct Segment {
     start: u32,
     end: u32,
     dynamic: bool,
-}
-
-/// 一条最终事件（用于写 XML）
-#[derive(Debug, Clone)]
-struct OutEvent {
-    real_start: u32,
-    real_end: u32,
-    png: String,
-    w: u32,
-    h: u32,
-    x: i32,
-    y: i32,
-    forced: String,
 }
 
 // ---------------------------------------------------------------------------
@@ -220,39 +204,47 @@ fn read_text(path: &Path) -> std::io::Result<String> {
             .collect();
         return Ok(String::from_utf16_lossy(&u16s));
     }
-    // GB18030 兜底：逐字节映射（够用，中文 ASS 主要是 utf-8/utf-16）
-    Ok(decode_gb18030(&raw))
+    // 系统 ANSI 代码页兜底（中文 Windows 即 GBK）。
+    // 必须真解码：之前把非 ASCII 一律换成 U+FFFD，不同台词解码后全都一样，
+    // 切段签名因此碰撞，时间相接的两句会被并成一段、只渲第一句（整串漏字幕）。
+    #[cfg(windows)]
+    if let Some(s) = decode_ansi(&raw) {
+        return Ok(s);
+    }
+    Ok(String::from_utf8_lossy(&raw).to_string())
 }
 
-/// 极简 GB18030/GBK 解码：两字节区求近似码位
-///
-/// 完整映射表太大，这里只处理常见区间：ASCII 直通 + 双字节按 GBK 区位还原成
-/// Unicode 近似。对「解析时间码/标签」这个用途足够——我们只需要正确切分
-/// Dialogue 行和识别 `\move` 等 ASCII 标签，中文内容本身不参与逻辑判断。
-fn decode_gb18030(raw: &[u8]) -> String {
-    let mut out = String::with_capacity(raw.len());
-    let mut i = 0usize;
-    while i < raw.len() {
-        let b = raw[i];
-        if b < 0x80 {
-            out.push(b as char);
-            i += 1;
-        } else if i + 1 < raw.len() && (0x81..=0xFE).contains(&b) {
-            // 双字节：用 char 的替换字符占位，保持长度语义
-            let b2 = raw[i + 1];
-            if (0x40..=0xFE).contains(&b2) {
-                out.push('\u{FFFD}');
-                i += 2;
-            } else {
-                out.push('\u{FFFD}');
-                i += 1;
-            }
-        } else {
-            out.push('\u{FFFD}');
-            i += 1;
-        }
+/// 用系统 API 按 ANSI 代码页解码，省掉内嵌两万字符的 GBK 表。
+#[cfg(windows)]
+fn decode_ansi(raw: &[u8]) -> Option<String> {
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn MultiByteToWideChar(
+            code_page: u32,
+            flags: u32,
+            multi_byte_str: *const u8,
+            cb_multi_byte: i32,
+            wide_char_str: *mut u16,
+            cch_wide_char: i32,
+        ) -> i32;
     }
-    out
+    const CP_ACP: u32 = 0;
+    if raw.is_empty() || raw.len() > i32::MAX as usize {
+        return None;
+    }
+    unsafe {
+        let n = MultiByteToWideChar(CP_ACP, 0, raw.as_ptr(), raw.len() as i32, std::ptr::null_mut(), 0);
+        if n <= 0 {
+            return None;
+        }
+        let mut buf = vec![0u16; n as usize];
+        let m = MultiByteToWideChar(CP_ACP, 0, raw.as_ptr(), raw.len() as i32, buf.as_mut_ptr(), n);
+        if m <= 0 {
+            return None;
+        }
+        buf.truncate(m as usize);
+        Some(String::from_utf16_lossy(&buf))
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -375,6 +367,14 @@ fn build_segments(events: &[Event]) -> Vec<Segment> {
     bounds.sort_unstable();
     bounds.dedup();
 
+    // 扫描线：事件按起点排序，边界点从左往右走时增量维护 active 集合。
+    // 早先的写法对每个边界窗口重扫一遍全部事件，是 O(n²)：1831 条事件 670 万次
+    // 比较还能忍，2 万条（MAX_SEGMENTS 的上限）会到 8 亿次，analyze 直接把界面卡死。
+    let mut order: Vec<usize> = (0..events.len()).collect();
+    order.sort_unstable_by_key(|&i| events[i].start);
+    let mut next = 0usize;
+    let mut active: Vec<usize> = Vec::new();
+
     let mut segs: Vec<Segment> = Vec::new();
     // 只有「时间相接 + 可见事件集合完全相同」才合并。字幕常常上一句结束就是
     // 下一句开始，若只看 dynamic 标记就会把整串台词并成一段，只渲第一句，
@@ -385,20 +385,21 @@ fn build_segments(events: &[Event]) -> Vec<Segment> {
         if b <= a {
             continue;
         }
-        let mut dyn_ = false;
-        let mut sig: Vec<(i32, &str, &str)> = Vec::new();
-        for e in events {
-            if e.start <= a && a < e.end {
-                if e.dynamic {
-                    dyn_ = true;
-                }
-                sig.push((e.layer, e.style.as_str(), e.text.as_str()));
-            }
+        while next < order.len() && events[order[next]].start <= a {
+            active.push(order[next]);
+            next += 1;
         }
-        if sig.is_empty() {
+        active.retain(|&i| events[i].end > a);
+
+        if active.is_empty() {
             last_sig = None;
             continue; // 空档：整段跳过
         }
+        let dyn_ = active.iter().any(|&i| events[i].dynamic);
+        let mut sig: Vec<(i32, &str, &str)> = active
+            .iter()
+            .map(|&i| (events[i].layer, events[i].style.as_str(), events[i].text.as_str()))
+            .collect();
         sig.sort_unstable();
         let mut key = String::new();
         key.push(if dyn_ { 'd' } else { 's' });
@@ -475,72 +476,6 @@ fn fps_str(fps: f64) -> String {
 // 结果 XML 解析
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone)]
-struct SubEvent {
-    forced: String,
-    itc: String,
-    otc: String,
-    w: u32,
-    h: u32,
-    x: i32,
-    y: i32,
-    png: String,
-}
-
-fn attr<'a>(tag: &'a str, key: &str) -> Option<&'a str> {
-    let pat = format!("{}=\"", key);
-    let i = tag.find(&pat)? + pat.len();
-    let rest = &tag[i..];
-    let j = rest.find('"')?;
-    Some(&rest[..j])
-}
-
-fn parse_result_xml(path: &Path) -> Vec<SubEvent> {
-    let text = match fs::read_to_string(path) {
-        Ok(t) => t,
-        Err(_) => return Vec::new(),
-    };
-    let mut out = Vec::new();
-    let mut rest = text.as_str();
-    while let Some(p) = rest.find("<Event ") {
-        let tag_end = match rest[p..].find('>') {
-            Some(e) => p + e + 1,
-            None => break,
-        };
-        let event_tag = &rest[p..tag_end];
-        let after = &rest[tag_end..];
-        let gstart = match after.find("<Graphic ") {
-            Some(g) => g,
-            None => break,
-        };
-        let gtag_end = match after[gstart..].find('>') {
-            Some(e) => gstart + e + 1,
-            None => break,
-        };
-        let gtag = &after[gstart..gtag_end];
-        let gclose = match after[gtag_end..].find("</Graphic>") {
-            Some(c) => gtag_end + c,
-            None => break,
-        };
-        let fname = after[gtag_end..gclose].trim();
-
-        if let (Some(itc), Some(otc)) = (attr(event_tag, "InTC"), attr(event_tag, "OutTC")) {
-            out.push(SubEvent {
-                forced: attr(event_tag, "Forced").unwrap_or("False").to_string(),
-                itc: itc.to_string(),
-                otc: otc.to_string(),
-                w: attr(gtag, "Width").and_then(|v| v.parse().ok()).unwrap_or(0),
-                h: attr(gtag, "Height").and_then(|v| v.parse().ok()).unwrap_or(0),
-                x: attr(gtag, "X").and_then(|v| v.parse().ok()).unwrap_or(0),
-                y: attr(gtag, "Y").and_then(|v| v.parse().ok()).unwrap_or(0),
-                png: fname.to_string(),
-            });
-        }
-        rest = &after[gclose..];
-    }
-    out
-}
-
 // ---------------------------------------------------------------------------
 // PGS (SUP) 时间戳重映射
 // ---------------------------------------------------------------------------
@@ -559,14 +494,15 @@ fn sup_retime(
     comp_frames: u32,
     real_frames: u32,
     drop_tail: bool,
-) -> Vec<u8> {
+) -> Result<Vec<u8>, String> {
     let frame_ticks = PGS_HZ / fps;
     let statics = comp_frames != real_frames;
 
-    // 拆段
+    // 拆段：只记区间，不复制字节（整片 42 MB 的 SUP 少走两趟内存）
     struct Seg {
         typ: u8,
-        buf: Vec<u8>,
+        s: usize,
+        e: usize,
     }
     let mut segs: Vec<Seg> = Vec::new();
     let mut i = 0usize;
@@ -579,13 +515,22 @@ fn sup_retime(
         let size = ((data[i + 11] as usize) << 8) | (data[i + 12] as usize);
         let end = i + 13 + size;
         if end > data.len() {
-            break;
+            // 以前这里静默 break，剩下的字节直接丢掉，产出的 .sup 尾巴缺失，
+            // 播放器上表现为最后一段字幕不显示。宁可报错让调用方指出是哪一段。
+            return Err(format!(
+                "SUP 被截断：段头声明 {} 字节负载，实际只剩 {}",
+                size,
+                data.len().saturating_sub(i + 13)
+            ));
         }
-        segs.push(Seg { typ, buf: data[i..end].to_vec() });
+        segs.push(Seg { typ, s: i, e: end });
         i = end;
     }
+    if i < data.len() && data[i..].starts_with(b"PG") {
+        return Err("SUP 尾部不完整（段头不足 13 字节）".into());
+    }
     if segs.is_empty() {
-        return data.to_vec();
+        return Ok(data.to_vec());
     }
 
     // 静态段渲的是 2 帧，尾部自带一个「清屏 epoch」。若下一段正好从这段结尾开始，
@@ -630,32 +575,32 @@ fn sup_retime(
     let mut pi = 0usize;
     let mut out: Vec<u8> = Vec::with_capacity(data.len());
     for s in &segs {
-        let mut buf = s.buf.clone();
+        let base = out.len();
+        out.extend_from_slice(&data[s.s..s.e]);
         match s.typ {
             0x16 => {
                 if pi < pcs_time.len() {
                     cur = pcs_time[pi];
                 }
                 let t = ts(cur).to_be_bytes();
-                buf[2..6].copy_from_slice(&t);
-                buf[6..10].copy_from_slice(&t);
+                out[base + 2..base + 6].copy_from_slice(&t);
+                out[base + 6..base + 10].copy_from_slice(&t);
                 pi += 1;
             }
             0x17 | 0x80 => {
                 let t = ts(cur).to_be_bytes();
-                buf[2..6].copy_from_slice(&t);
-                buf[6..10].copy_from_slice(&t);
+                out[base + 2..base + 6].copy_from_slice(&t);
+                out[base + 6..base + 10].copy_from_slice(&t);
             }
             0x15 => {
                 let t = ts((cur - 1.0).max(0.0)).to_be_bytes();
-                buf[2..6].copy_from_slice(&t);
-                buf[6..10].copy_from_slice(&t);
+                out[base + 2..base + 6].copy_from_slice(&t);
+                out[base + 6..base + 10].copy_from_slice(&t);
             }
             _ => {} // PDS 原样
         }
-        out.extend_from_slice(&buf);
     }
-    out
+    Ok(out)
 }
 
 // ---------------------------------------------------------------------------
@@ -774,6 +719,21 @@ fn pick_str(v: &Value, k: &str) -> String {
     }
 }
 
+/// 零依赖伪随机：RandomState 每次构造都带随机种子，再混入 pid 与纳秒时间。
+/// 只用于临时目录名，不需要密码学强度，但足以让名字猜不到。
+fn rand_u64() -> u64 {
+    use std::hash::{BuildHasher, Hasher};
+    let mut h = std::collections::hash_map::RandomState::new().build_hasher();
+    h.write_u64(std::process::id() as u64);
+    h.write_u128(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0),
+    );
+    h.finish()
+}
+
 /// 已经装好的运行参数
 struct RunOpts {
     ass: PathBuf,
@@ -803,20 +763,26 @@ fn read_opts(v: &Value) -> Result<RunOpts, String> {
     let ass = fs::canonicalize(&ass_raw).map_err(|_| format!("找不到文件: {}", ass_raw))?;
     let fps = {
         let f = pick_f64(v, "fps");
-        if f > 1.0 { f } else { 23.976 }
+        // 上限 240：再高 PGS 的 90 kHz 时间基就撑不住了（90000/1e6=0.09 tick/帧），
+        // 时间戳会全部取整成同一值，产出的 SUP 每个 PCS 都是 0。
+        if f >= 1.0 && f <= 240.0 { f } else { 23.976 }
     };
     let jobs = {
         let j = pick_u32(v, "jobs");
+        // 每段一个子进程，每个进程几十 MB；64 路已经能吃掉几 GB 内存
         (if j == 0 { 4 } else { j.min(64) }) as usize
     };
     let out = pick_str(v, "outdir");
     let mod_root = pick_str(v, "mod_root");
+    // 分辨率：0 表示沿用 ASS 的 PlayRes。上限 8192×8192，
+    // 否则 LanczosResize 会直接把内存吃爆（4K 的 4 倍已经远超实用范围）。
+    let cap = |n: u32| -> u32 { if n > 0 { n.min(8192) } else { 0 } };
     Ok(RunOpts {
         ass,
         fps,
         jobs,
-        width: pick_u32(v, "width"),
-        height: pick_u32(v, "height"),
+        width: cap(pick_u32(v, "width")),
+        height: cap(pick_u32(v, "height")),
         vfmt: {
             let s = pick_str(v, "vfmt");
             if s.is_empty() { "1080p".into() } else { s }
@@ -990,6 +956,22 @@ fn hms(sec: f64) -> String {
 // 结果 XML：一个 Event 可能挂多个 Graphic（多窗口字幕）
 // ---------------------------------------------------------------------------
 
+/// 取标签属性值。不构造 `format!("{}=\"", key)` —— 每个 Graphic 要调 8 次，
+/// 整片上万个临时字符串全是为了比几个字节。
+fn attr<'a>(tag: &'a str, key: &str) -> Option<&'a str> {
+    let mut from = 0usize;
+    while let Some(p) = tag[from..].find(key) {
+        let i = from + p + key.len();
+        if tag[i..].starts_with("=\"") {
+            let rest = &tag[i + 2..];
+            let j = rest.find('"')?;
+            return Some(&rest[..j]);
+        }
+        from = i;
+    }
+    None
+}
+
 #[derive(Debug, Clone)]
 struct Graphic {
     w: u32,
@@ -1067,7 +1049,11 @@ fn parse_result_xml_all(path: &Path) -> Vec<ResultEvent> {
 // ---------------------------------------------------------------------------
 
 fn kill_tree(pid: u32) {
-    let mut c = Command::new("taskkill");
+    // 绝对路径：CreateProcess 会按当前目录/PATH 搜索，绿色版解压在可写目录时可能被塞同名 exe
+    let taskkill = std::env::var("SystemRoot")
+        .map(|r| format!("{}\\System32\\taskkill.exe", r))
+        .unwrap_or_else(|_| "taskkill".into());
+    let mut c = Command::new(taskkill);
     #[cfg(windows)]
     c.creation_flags(CREATE_NO_WINDOW);
     let _ = c
@@ -1155,6 +1141,22 @@ pub fn convert(opts: &Value, emit: Emit, cancel: Arc<AtomicBool>) -> Result<Valu
     if segs.is_empty() {
         return Err("切段结果为空".into());
     }
+
+    // 「只看计划」：切完就返回，不调 avs2bdnxml、不建输出目录。
+    // 这个开关之前只是读进来没用，勾了照样整片渲染。
+    if o.dry_run {
+        let sta = segs.iter().filter(|s| !s.dynamic).count();
+        let dyn_frames: u32 = segs.iter().filter(|s| s.dynamic).map(|s| s.end - s.start).sum();
+        emit(json!({"t":"stage","name":"plan","total":segs.len()}));
+        return Ok(json!({
+            "t":"done", "ok": true, "dry_run": true,
+            "outdir": "", "xml": "", "sup": "",
+            "pngs": 0, "epochs": 0, "failed": 0, "failed_segs": [],
+            "secs": 0.0, "frames": total_frames, "speed": 0.0, "sup_size": 0,
+            "events": ass.events.len(), "segs": segs.len(),
+            "sta": sta, "dyn_frames": dyn_frames,
+        }));
+    }
     if segs.len() > MAX_SEGMENTS {
         return Err(format!(
             "切段数 {} 超过上限 {}；逐段调用的固定开销会吃掉收益。请拆分子幕或直接用原版。",
@@ -1175,15 +1177,24 @@ pub fn convert(opts: &Value, emit: Emit, cancel: Arc<AtomicBool>) -> Result<Valu
     });
     fs::create_dir_all(&outdir).map_err(|e| format!("建输出目录失败: {}", e))?;
 
-    let tmp = std::env::temp_dir().join(format!(
-        "supfast_{}_{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_millis())
-            .unwrap_or(0)
-    ));
-    fs::create_dir_all(&tmp).map_err(|e| format!("建临时目录失败: {}", e))?;
+    // 临时目录必须独占创建：名字若可预测，别人可以预先建好同名 junction / 符号链接，
+    // create_dir_all 对已存在目录不报错，后续写入就被重定向到别处。
+    let tmp = {
+        let base = std::env::temp_dir();
+        let mut picked = None;
+        for _ in 0..8 {
+            let cand = base.join(format!("supfast_{:016x}", rand_u64()));
+            match fs::create_dir(&cand) {
+                Ok(()) => {
+                    picked = Some(cand);
+                    break;
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(e) => return Err(format!("建临时目录失败: {}", e)),
+            }
+        }
+        picked.ok_or("建临时目录失败：连续 8 次都撞名")?
+    };
 
     let t0 = Instant::now();
     let result = (|| -> Result<Value, String> {
@@ -1250,7 +1261,7 @@ pub fn convert(opts: &Value, emit: Emit, cancel: Arc<AtomicBool>) -> Result<Valu
                     break;
                 }
                 let job = {
-                    let mut q = queue.lock().unwrap();
+                    let mut q = queue.lock().unwrap_or_else(|e| e.into_inner());
                     q.pop()
                 };
                 let job = match job {
@@ -1289,7 +1300,7 @@ pub fn convert(opts: &Value, emit: Emit, cancel: Arc<AtomicBool>) -> Result<Valu
                 }
                 emit(json!({"t":"seg","done":n,"total":total_jobs,"pngs":pngs.load(Ordering::SeqCst)}));
 
-                outs.lock().unwrap().push(Done {
+                outs.lock().unwrap_or_else(|e| e.into_inner()).push(Done {
                     idx: job.idx,
                     seg: job.seg,
                     wdir: job.wdir.clone(),
@@ -1308,7 +1319,7 @@ pub fn convert(opts: &Value, emit: Emit, cancel: Arc<AtomicBool>) -> Result<Valu
         }
 
         let mut outs = {
-            let mut g = outs.lock().unwrap();
+            let mut g = outs.lock().unwrap_or_else(|e| e.into_inner());
             std::mem::take(&mut *g)
         };
         outs.sort_by_key(|d| d.seg.start);
@@ -1374,7 +1385,11 @@ pub fn convert(opts: &Value, emit: Emit, cancel: Arc<AtomicBool>) -> Result<Valu
                 if sp.is_file() {
                     if let Ok(raw) = fs::read(&sp) {
                         let comp_n = if d.seg.dynamic { d.seg.end - d.seg.start } else { MIN_STATIC_FRAMES };
-                        let retimed = sup_retime(&raw, o.fps, d.seg.start, comp_n, d.seg.end - d.seg.start, d.contig);
+                        let retimed =
+                            sup_retime(&raw, o.fps, d.seg.start, comp_n, d.seg.end - d.seg.start, d.contig)
+                                .map_err(|e| {
+                                    format!("第 {} 段（{}）{}", d.idx, frames_to_tc(d.seg.start, o.fps), e)
+                                })?;
                         let rf = d.wdir.join("retimed.sup");
                         if fs::write(&rf, &retimed).is_ok() {
                             sup_parts.push((d.seg.start, rf));

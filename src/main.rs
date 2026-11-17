@@ -28,6 +28,9 @@ struct Job {
     error: Option<String>,
     started: Option<std::time::Instant>,
     plan: Option<Value>,
+    /// 本次任务专属的取消标志。每次开跑新建一个，旧线程看自己的那个，
+    /// 新任务重置不到它——用共享的一个 bool 会出现「重置把旧任务复活」。
+    token: Option<Arc<AtomicBool>>,
 }
 
 #[derive(Clone)]
@@ -36,10 +39,15 @@ struct Shared {
     recent: Arc<Mutex<Vec<Value>>>,
     history: Arc<Mutex<Vec<Value>>>,
     job: Arc<Mutex<Job>>,
-    cancel: Arc<AtomicBool>,
     log: Arc<Mutex<Vec<Value>>>,
     seq: Arc<AtomicUsize>,
     file: Arc<Mutex<PathBuf>>,
+}
+
+/// 锁中毒（持锁线程 panic）时不 panic，取出内部值继续用。
+/// 直接 unwrap 会让之后每一次 IPC 调用都炸，界面表现为「点了全没反应」。
+fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(|e| e.into_inner())
 }
 
 const DEFAULT_SETTINGS: &str = r#"{
@@ -75,7 +83,6 @@ impl Shared {
             recent: Arc::new(Mutex::new(recent)),
             history: Arc::new(Mutex::new(history)),
             job: Arc::new(Mutex::new(Job::default())),
-            cancel: Arc::new(AtomicBool::new(false)),
             log: Arc::new(Mutex::new(Vec::new())),
             seq: Arc::new(AtomicUsize::new(0)),
             file: Arc::new(Mutex::new(state_file)),
@@ -83,14 +90,14 @@ impl Shared {
     }
 
     fn save(&self) {
-        let path = self.file.lock().unwrap().clone();
+        let path = lock(&self.file).clone();
         if let Some(dir) = path.parent() {
             let _ = std::fs::create_dir_all(dir);
         }
         let body = json!({
-            "settings": self.settings.lock().unwrap().clone(),
-            "recent": self.recent.lock().unwrap().clone(),
-            "history": self.history.lock().unwrap().clone(),
+            "settings": lock(&self.settings).clone(),
+            "recent": lock(&self.recent).clone(),
+            "history": lock(&self.history).clone(),
         });
         if let Ok(s) = serde_json::to_string_pretty(&body) {
             let _ = std::fs::write(&path, s);
@@ -98,8 +105,8 @@ impl Shared {
     }
 
     fn push_log(&self, line: String, kind: &str) {
-        let n = self.seq.fetch_add(1, Ordering::SeqCst) + 1;
-        let mut g = self.log.lock().unwrap();
+        let n = self.seq.fetch_add(1, Ordering::Relaxed) + 1;
+        let mut g = lock(&self.log);
         g.push(json!({ "seq": n, "line": line, "kind": kind }));
         if g.len() > 3000 {
             let cut = g.len() - 2000;
@@ -108,12 +115,12 @@ impl Shared {
     }
 
     fn clear_log(&self) {
-        self.log.lock().unwrap().clear();
-        self.seq.store(0, Ordering::SeqCst);
+        lock(&self.log).clear();
+        self.seq.store(0, Ordering::Relaxed);
     }
 
     fn mod_root(&self) -> Option<String> {
-        let s = self.settings.lock().unwrap();
+        let s = lock(&self.settings);
         s.get("mod_root")
             .and_then(|x| x.as_str())
             .map(|x| x.to_string())
@@ -151,7 +158,7 @@ fn remember(sh: &Shared, path: &str) {
     }
     let name = file_name(path);
     let key = path.replace('\\', "/").to_lowercase();
-    let mut r = sh.recent.lock().unwrap();
+    let mut r = lock(&sh.recent);
     r.retain(|x| {
         x.get("path")
             .and_then(|p| p.as_str())
@@ -168,7 +175,7 @@ fn remember(sh: &Shared, path: &str) {
 
 fn status_of(sh: &Shared, since: usize) -> Value {
     let (running, stage, pct, done, total, pngs, result, error, plan, elapsed) = {
-        let j = sh.job.lock().unwrap();
+        let j = lock(&sh.job);
         (
             j.running,
             j.stage.clone(),
@@ -182,10 +189,7 @@ fn status_of(sh: &Shared, since: usize) -> Value {
             j.started.map(|t| t.elapsed().as_secs_f64()).unwrap_or(0.0),
         )
     };
-    let lines: Vec<Value> = sh
-        .log
-        .lock()
-        .unwrap()
+    let lines: Vec<Value> = lock(&sh.log)
         .iter()
         .filter(|l| l.get("seq").and_then(|s| s.as_u64()).unwrap_or(0) as usize > since)
         .cloned()
@@ -215,9 +219,9 @@ fn route(sh: &Shared, route: &str, body: &Value) -> Result<Value, String> {
             let env = engine::probe_env(sh.mod_root().as_deref());
             Ok(json!({
                 "ok": true,
-                "settings": sh.settings.lock().unwrap().clone(),
-                "recent": sh.recent.lock().unwrap().clone(),
-                "history": sh.history.lock().unwrap().clone(),
+                "settings": lock(&sh.settings).clone(),
+                "recent": lock(&sh.recent).clone(),
+                "history": lock(&sh.history).clone(),
                 "env": env.get("items").cloned().unwrap_or(json!([])),
                 "mod_dir": env.get("mod_dir").cloned().unwrap_or(json!("")),
                 "version": env!("CARGO_PKG_VERSION"),
@@ -232,7 +236,7 @@ fn route(sh: &Shared, route: &str, body: &Value) -> Result<Value, String> {
         // ---------------- 设置 ----------------
         "/api/settings" => {
             if let Some(new) = body.get("settings").and_then(|s| s.as_object()) {
-                let mut s = sh.settings.lock().unwrap();
+                let mut s = lock(&sh.settings);
                 for (k, v) in new {
                     s[k] = v.clone();
                 }
@@ -249,9 +253,9 @@ fn route(sh: &Shared, route: &str, body: &Value) -> Result<Value, String> {
         "/api/state" => {
             Ok(json!({
                 "ok": true,
-                "recent": sh.recent.lock().unwrap().clone(),
-                "history": sh.history.lock().unwrap().clone(),
-                "settings": sh.settings.lock().unwrap().clone(),
+                "recent": lock(&sh.recent).clone(),
+                "history": lock(&sh.history).clone(),
+                "settings": lock(&sh.settings).clone(),
             }))
         }
 
@@ -265,35 +269,39 @@ fn route(sh: &Shared, route: &str, body: &Value) -> Result<Value, String> {
 
         // ---------------- 开跑 ----------------
         "/api/start" => {
-            if sh.job.lock().unwrap().running {
-                return Err("已有任务在跑".into());
-            }
             let opts = body.get("opts").cloned().unwrap_or_else(|| json!({}));
             let ass = opts.get("ass").and_then(|a| a.as_str()).unwrap_or("").to_string();
             if ass.is_empty() || !Path::new(&ass).is_file() {
                 return Err("请先选择 .ass 字幕".into());
             }
+
+            // 占位：检查与置位必须在同一次加锁内完成，否则两个并发 invoke
+            // 都能通过检查，起两个线程同时往一个 outdir 写，产物互相覆盖。
+            let token = Arc::new(AtomicBool::new(false));
+            {
+                let mut j = lock(&sh.job);
+                if j.running {
+                    return Err("已有任务在跑".into());
+                }
+                *j = Job {
+                    running: true,
+                    stage: "plan".into(),
+                    pct: 1.0,
+                    started: Some(std::time::Instant::now()),
+                    token: Some(token.clone()),
+                    ..Job::default()
+                };
+            }
+
             if let Some(obj) = opts.as_object() {
-                let mut s = sh.settings.lock().unwrap();
+                let mut s = lock(&sh.settings);
                 for (k, v) in obj {
                     s[k] = v.clone();
                 }
             }
             remember(sh, &ass);
             sh.save();
-
             sh.clear_log();
-            sh.cancel.store(false, Ordering::SeqCst);
-            {
-                let mut j = sh.job.lock().unwrap();
-                *j = Job {
-                    running: true,
-                    stage: "plan".into(),
-                    pct: 1.0,
-                    started: Some(std::time::Instant::now()),
-                    ..Job::default()
-                };
-            }
 
             let fps = engine::pick_f64(&opts, "fps");
             sh.push_log(
@@ -320,7 +328,7 @@ fn route(sh: &Shared, route: &str, body: &Value) -> Result<Value, String> {
                     match t {
                         "stage" => {
                             let name = ev.get("name").and_then(|x| x.as_str()).unwrap_or("").to_string();
-                            let mut j = sh3.job.lock().unwrap();
+                            let mut j = lock(&sh3.job);
                             if name == "plan" {
                                 j.stage = "plan".into();
                             } else if name == "render" {
@@ -341,7 +349,7 @@ fn route(sh: &Shared, route: &str, body: &Value) -> Result<Value, String> {
                             let total = ev.get("total").and_then(|x| x.as_u64()).unwrap_or(1) as usize;
                             let pngs = ev.get("pngs").and_then(|x| x.as_u64()).unwrap_or(0) as usize;
                             {
-                                let mut j = sh3.job.lock().unwrap();
+                                let mut j = lock(&sh3.job);
                                 j.done = done;
                                 j.total = total;
                                 j.pngs = pngs;
@@ -362,9 +370,11 @@ fn route(sh: &Shared, route: &str, body: &Value) -> Result<Value, String> {
                     }
                 });
 
-                let res = engine::convert(&opts, emit, sh2.cancel.clone());
+                // token 交给引擎，另留一份用于判断这次退出是不是取消
+                let tk = token.clone();
+                let res = engine::convert(&opts, emit, tk);
                 {
-                    let mut j = sh2.job.lock().unwrap();
+                    let mut j = lock(&sh2.job);
                     j.running = false;
                 }
                 match res {
@@ -394,25 +404,25 @@ fn route(sh: &Shared, route: &str, body: &Value) -> Result<Value, String> {
                             sh2.push_log(format!("[warn] 有 {} 段渲染失败，PNG 会缺", failed), "err");
                         }
                         {
-                            let mut j = sh2.job.lock().unwrap();
+                            let mut j = lock(&sh2.job);
                             j.stage = "done".into();
                             j.pct = 100.0;
                             j.result = Some(v.clone());
                         }
                         {
-                            let mut h = sh2.history.lock().unwrap();
+                            let mut h = lock(&sh2.history);
                             h.insert(0, v);
                             h.truncate(24);
                         }
                         sh2.save();
                     }
                     Err(e) => {
-                        let cancelled = sh2.cancel.load(Ordering::SeqCst);
+                        let cancelled = token.load(Ordering::SeqCst);
                         sh2.push_log(
                             format!("[error] {}", e),
                             if cancelled { "dim" } else { "err" },
                         );
-                        let mut j = sh2.job.lock().unwrap();
+                        let mut j = lock(&sh2.job);
                         j.stage = if cancelled { "cancel".into() } else { "error".into() };
                         j.pct = 0.0;
                         j.error = if cancelled { None } else { Some(e) };
@@ -424,7 +434,11 @@ fn route(sh: &Shared, route: &str, body: &Value) -> Result<Value, String> {
         }
 
         "/api/cancel" => {
-            sh.cancel.store(true, Ordering::SeqCst);
+            // 只取消当前任务的 token，不会影响之后的任何一次
+            let t = lock(&sh.job).token.clone();
+            if let Some(t) = t {
+                t.store(true, Ordering::SeqCst);
+            }
             sh.push_log("收到取消请求…".into(), "dim");
             Ok(json!({ "ok": true }))
         }
@@ -445,16 +459,14 @@ fn route(sh: &Shared, route: &str, body: &Value) -> Result<Value, String> {
             match kind {
                 "history" => {
                     let ts = body.get("ts").and_then(|x| x.as_f64()).unwrap_or(-1.0);
-                    sh.history.lock().unwrap().retain(|h| {
+                    lock(&sh.history).retain(|h| {
                         (h.get("ts").and_then(|t| t.as_f64()).unwrap_or(-2.0) - ts).abs() > 1e-6
                     });
                 }
-                "history-all" => sh.history.lock().unwrap().clear(),
+                "history-all" => lock(&sh.history).clear(),
                 "recent" => {
                     let p = body.get("path").and_then(|x| x.as_str()).unwrap_or("");
-                    sh.recent
-                        .lock()
-                        .unwrap()
+                    lock(&sh.recent)
                         .retain(|r| r.get("path").and_then(|x| x.as_str()).unwrap_or("") != p);
                 }
                 _ => {}
@@ -469,7 +481,11 @@ fn route(sh: &Shared, route: &str, body: &Value) -> Result<Value, String> {
                 return Err("路径不存在".into());
             }
             let mode = body.get("mode").and_then(|x| x.as_str()).unwrap_or("file");
-            let mut cmd = std::process::Command::new("explorer");
+            // 用绝对路径，避免 CreateProcess 按 PATH/当前目录搜索被人塞个同名 exe
+            let explorer = std::env::var("SystemRoot")
+                .map(|r| format!("{}\\explorer.exe", r))
+                .unwrap_or_else(|_| "explorer.exe".into());
+            let mut cmd = std::process::Command::new(explorer);
             if mode == "dir" {
                 cmd.arg(p);
             } else {
@@ -607,6 +623,27 @@ fn main() {
                         .unwrap_or_else(|_| PathBuf::from("."))
                 });
             app.manage(Shared::new(dir.join("state.json")));
+
+            // 关窗时先叫停转换线程并等它收尾。否则线程随进程退出被直接杀掉，
+            // convert() 末尾的临时目录清理不会执行，%TEMP% 里会攒下几 GB 的 PNG。
+            if let Some(win) = app.get_webview_window("main") {
+                let sh = app.state::<Shared>().inner().clone();
+                win.on_window_event(move |ev| {
+                    if let tauri::WindowEvent::CloseRequested { .. } = ev {
+                        let t = lock(&sh.job).token.clone();
+                        if let Some(t) = t {
+                            t.store(true, Ordering::SeqCst);
+                            // 最多等 6 秒：段渲染每 35ms 检查一次取消，收尾主要是删临时目录
+                            for _ in 0..60 {
+                                if !lock(&sh.job).running {
+                                    break;
+                                }
+                                std::thread::sleep(std::time::Duration::from_millis(100));
+                            }
+                        }
+                    }
+                });
+            }
 
             // 关掉 WebView2 的默认右键菜单（刷新 / 另存为 / 打印 / 检查）。
             // 页面里也拦了 contextmenu，但 WebView2 的菜单是宿主进程画的，
