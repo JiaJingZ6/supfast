@@ -117,6 +117,38 @@ dist\
 Windows 会为**每一段的每个子进程**分配 conhost —— 整片 1832 段下来从 102 秒拖到 270 秒，还会闪窗。
 `engine.rs` 的 `run_seg()` 里已经加了。
 
+## 打包发布
+
+`pack-release.bat` 把 `dist\` 加上 `packaging\release-readme.txt` 打成一个 zip：
+
+```bat
+build.bat          :: 先编译出 dist\
+pack-release.bat   :: 产出 release\supfast-1.0.0-win64.zip（约 3.1 MB）
+```
+
+解压后是一个自成一体的目录：`supfast.exe`、`WebView2Loader.dll`、`mod\`，以及给最终用户的 `README.txt`
+（系统要求、首次使用、数据位置、目录说明）。
+
+**这个包天然是「全新默认状态」**，因为用户数据不在程序目录里：
+
+```
+设置 / 最近 / 历史  →  %APPDATA%\supfast-desktop\state.json
+```
+
+`state.json` 由程序在第一次改动设置时才创建，`dist\` 里永远不会出现它 —— 脚本里还加了一道检查，
+万一手滑把它复制进 `dist\`，打包会直接失败。所以谁解压这个包，谁看到的就是空文件行、
+空的「最近」、空的历史、默认参数（23.976 / 1080p / 8 路）。
+
+想在本机模拟「新用户第一次启动」，不必删自己的状态，换个 APPDATA 就行：
+
+```bat
+set APPDATA=%TEMP%\supfast-fresh
+dist\supfast.exe
+```
+
+期望看到：文件行「未选择文件 · 拖入 .ass 或 .ssa」、最近 0 条、历史 0 条、输出目录空、
+`开始转换` 灰色、切段计划「尚未分析」。
+
 ## 调试钩子
 
 ```bat
