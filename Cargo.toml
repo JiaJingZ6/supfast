@@ -1,0 +1,28 @@
+[package]
+name = "supfast"
+version = "1.0.0"
+edition = "2021"
+description = "supfast — ASS 字幕转 PGS，只渲染必要的帧"
+
+[[bin]]
+name = "supfast"
+path = "src/main.rs"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+tauri-plugin-dialog = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[target.'cfg(windows)'.dependencies]
+webview2-com = "0.39"
+
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true

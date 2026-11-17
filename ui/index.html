@@ -1,0 +1,1446 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self' ipc: http://ipc.localhost">
+<title>supfast</title>
+<script>
+/* 主题要在首帧之前定下来：主进程把最终主题塞进 location.hash（#t=dark） */
+(function(){
+  try{
+    var m = /t=(dark|light)/.exec(location.hash || '');
+    document.documentElement.dataset.theme = m ? m[1] : 'light';
+  }catch(e){ document.documentElement.dataset.theme = 'light'; }
+})();
+</script>
+<style>
+/* ============================================================
+   令牌：一套冷石墨中性色，三级文字，一个强调色
+   强调色只表示一件事 —— 需要真正渲染的画面
+   ============================================================ */
+:root{
+  color-scheme: light;
+
+  --bg:#f1f3f4;
+  --panel:#ffffff;
+  --sunken:#eceeef;
+  --track:#e9ebec;
+  --seg:#c3c9cc;
+  --seg-hi:#a9b0b4;
+  --hover:#f0f2f3;
+
+  --line:#dcdfe1;
+  --line-soft:#ebedee;
+  --line-mid:#c3c8cb;
+
+  --ink:#11161a;
+  --ink-2:#333c42;
+  --ink-3:#5d676d;
+  --ink-4:#8b9499;
+
+  --accent:#c2410c;
+  --accent-ink:#a03a0c;
+  --accent-bg:rgba(194,65,12,.09);
+
+  --sw-on:#11161a;
+  --sw-knob:#ffffff;
+  --sw-sh:0 1px 2px rgba(0,0,0,.28);
+
+  --ok:#187a5c;
+  --err:#b02a1d;
+
+  --drag:rgba(255,255,255,.86);
+  --sh:0 1px 2px rgba(17,22,26,.04), 0 12px 28px -22px rgba(17,22,26,.35);
+  --sh-pop:0 2px 6px rgba(17,22,26,.06), 0 18px 36px -20px rgba(17,22,26,.35);
+
+  --font:"Segoe UI Variable Text","Segoe UI","Microsoft YaHei UI","PingFang SC",system-ui,sans-serif;
+  --mono:"Cascadia Mono","Consolas","SFMono-Regular",ui-monospace,monospace;
+
+  --ease:cubic-bezier(.32,.72,0,1);
+  --chev:url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='10' height='10' viewBox='0 0 12 12'><path d='M2.8 4.8L6 8l3.2-3.2' fill='none' stroke='%235d676d' stroke-width='1.3' stroke-linecap='round' stroke-linejoin='round'/></svg>");
+}
+
+:root[data-theme="dark"]{
+  color-scheme: dark;
+
+  --bg:#0e1011;
+  --panel:#161a1c;
+  --sunken:#101314;
+  --track:#212629;
+  --seg:#4b5357;
+  --seg-hi:#5e676b;
+  --hover:#1d2225;
+
+  --line:#282e31;
+  --line-soft:#1f2426;
+  --line-mid:#3a4245;
+
+  --ink:#e9ecee;
+  --ink-2:#b5bdc1;
+  --ink-3:#828b90;
+  --ink-4:#5e676b;
+
+  --accent:#f97316;
+  --accent-ink:#fba25a;
+  --accent-bg:rgba(249,115,22,.12);
+
+  --sw-on:#d6dbde;
+  --sw-knob:#161a1c;
+  --sw-sh:none;
+
+  --ok:#3fbc8f;
+  --err:#f0796c;
+
+  --drag:rgba(14,16,17,.86);
+  --sh:0 1px 2px rgba(0,0,0,.5);
+  --sh-pop:0 2px 8px rgba(0,0,0,.55), 0 18px 40px -24px rgba(0,0,0,.8);
+
+  --chev:url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='10' height='10' viewBox='0 0 12 12'><path d='M2.8 4.8L6 8l3.2-3.2' fill='none' stroke='%23828b90' stroke-width='1.3' stroke-linecap='round' stroke-linejoin='round'/></svg>");
+}
+
+/* ============================================================ 基础 */
+*{box-sizing:border-box}
+html,body{margin:0;padding:0}
+body{
+  min-height:100vh;
+  background:var(--bg);
+  color:var(--ink);
+  font-family:var(--font);
+  font-size:13px;
+  line-height:1.5;
+  -webkit-font-smoothing:antialiased;
+  overflow-x:hidden;
+}
+::selection{background:var(--accent-bg);color:var(--accent-ink)}
+::-webkit-scrollbar{width:0;height:0;display:none}
+*{scrollbar-width:none;-ms-overflow-style:none}
+html{overscroll-behavior:none}
+button{font-family:inherit;font-size:inherit;color:inherit;background:none;border:none;padding:0;cursor:pointer}
+input,select{font-family:inherit;font-size:inherit;color:inherit}
+a{color:inherit;text-decoration:none}
+:focus-visible{outline:2px solid var(--accent);outline-offset:2px;border-radius:4px}
+.ic{width:16px;height:16px;fill:none;stroke:currentColor;stroke-width:1.5;stroke-linecap:round;stroke-linejoin:round;flex:0 0 auto}
+.mono{font-family:var(--mono);font-variant-numeric:tabular-nums}
+.num{font-variant-numeric:tabular-nums}
+
+/* ============================================================ 标题栏 */
+.titlebar{
+  position:sticky;top:0;z-index:90;height:36px;
+  display:flex;align-items:center;justify-content:space-between;
+  padding-left:16px;
+  background:var(--bg);
+  border-bottom:1px solid var(--line);
+}
+.tb-left{display:flex;align-items:center;gap:9px;font-size:12px;color:var(--ink-3);min-width:0}
+.mark{display:flex;align-items:center;gap:2px;flex:0 0 auto}
+.mark i{display:block;width:3px;height:11px;background:var(--ink-4);border-radius:.5px}
+.mark i:last-child{background:var(--accent)}
+.tb-left b{font-weight:600;color:var(--ink-2);letter-spacing:-.005em}
+.tb-sep{width:1px;height:11px;background:var(--line-mid)}
+.tb-spec{font-family:var(--mono);font-size:11px;color:var(--ink-4);letter-spacing:.02em}
+.tb-right{display:flex;height:100%}
+.tb-btn{width:42px;height:35px;display:grid;place-items:center;color:var(--ink-3);transition:background-color .12s var(--ease),color .12s var(--ease)}
+.tb-btn .ic{width:13px;height:13px;stroke-width:1.3}
+.tb-btn:hover{background:var(--sunken);color:var(--ink)}
+.tb-btn.close:hover{background:var(--err);color:#fff}
+
+/* ============================================================ 外壳 */
+.app{max-width:1280px;margin:0 auto;padding:22px 24px 56px}
+
+/* 页头 */
+.head{display:flex;align-items:flex-start;gap:16px;margin-bottom:20px}
+.head h1{margin:0;font-size:19px;font-weight:600;letter-spacing:-.015em;line-height:1.2;color:var(--ink)}
+.head p{margin:5px 0 0;font-size:12px;color:var(--ink-3)}
+.head-actions{margin-left:auto;display:flex;align-items:center;gap:8px;padding-top:2px}
+.spec-btn{
+  display:flex;align-items:center;height:30px;padding:0 10px;border-radius:6px;
+  border:1px solid transparent;font-family:var(--mono);font-size:11.5px;color:var(--ink-3);
+  transition:background-color .12s var(--ease),border-color .12s var(--ease);
+}
+.spec-btn:hover{background:var(--panel);border-color:var(--line);color:var(--ink-2)}
+.icon-btn{
+  width:30px;height:30px;border-radius:6px;display:grid;place-items:center;
+  color:var(--ink-3);border:1px solid transparent;
+  transition:background-color .12s var(--ease),border-color .12s var(--ease),color .12s var(--ease);
+}
+.icon-btn:hover{background:var(--panel);border-color:var(--line);color:var(--ink)}
+.icon-btn .ic{width:15px;height:15px}
+
+/* 主题：三态分段控件，比"循环切换的单图标"少一层猜测 */
+.seg-ctl{display:flex;padding:2px;gap:2px;border:1px solid var(--line);border-radius:7px;background:var(--panel)}
+.seg-ctl button{width:28px;height:24px;border-radius:5px;display:grid;place-items:center;color:var(--ink-4);transition:background-color .12s var(--ease),color .12s var(--ease)}
+.seg-ctl button .ic{width:14px;height:14px}
+.seg-ctl button:hover{color:var(--ink-2)}
+.seg-ctl button.on{background:var(--sunken);color:var(--ink)}
+
+/* 标签页 */
+.tabs{display:flex;align-items:center;gap:22px;border-bottom:1px solid var(--line);margin-bottom:20px}
+.tab{
+  position:relative;display:flex;align-items:center;gap:5px;
+  padding:0 0 10px;font-size:13px;color:var(--ink-3);
+  transition:color .12s var(--ease);
+}
+.tab:hover{color:var(--ink-2)}
+.tab.on{color:var(--ink);font-weight:500}
+.tab.on::after{content:"";position:absolute;left:0;right:0;bottom:-1px;height:1.5px;background:var(--ink)}
+.tcount{font-family:var(--mono);font-size:11px;color:var(--ink-4);font-weight:400}
+.tcount:empty{display:none}
+
+.pane{display:none}
+.pane.on{display:block}
+
+/* ============================================================ 按钮 */
+.btn{
+  display:inline-flex;align-items:center;gap:7px;
+  height:34px;padding:0 14px;border-radius:7px;
+  border:1px solid var(--line);background:var(--panel);color:var(--ink-2);
+  font-size:12.5px;font-weight:500;white-space:nowrap;
+  transition:background-color .12s var(--ease),border-color .12s var(--ease),color .12s var(--ease);
+}
+.btn .ic{width:15px;height:15px}
+.btn:hover:not(:disabled){background:var(--sunken);border-color:var(--line-mid);color:var(--ink)}
+.btn.primary{background:var(--ink);border-color:var(--ink);color:var(--bg)}
+.btn.primary:hover:not(:disabled){background:var(--ink-2);border-color:var(--ink-2);color:var(--bg)}
+.btn:disabled{opacity:.38;cursor:not-allowed}
+.btn.ghost{border-color:transparent;background:none}
+.btn.ghost:hover:not(:disabled){background:var(--sunken);border-color:transparent}
+.linkbtn{font-size:12px;color:var(--ink-3);border-bottom:1px solid var(--line-mid);padding-bottom:1px;transition:color .12s var(--ease),border-color .12s var(--ease)}
+.linkbtn:hover{color:var(--ink);border-color:var(--ink-3)}
+
+/* ============================================================ 文件行 */
+.loadbar{display:grid;grid-template-columns:minmax(0,1fr) auto auto;gap:8px}
+.loadfield{
+  display:flex;align-items:center;gap:12px;min-width:0;
+  height:52px;padding:0 14px;border-radius:9px;
+  background:var(--panel);border:1px solid var(--line);
+  transition:border-color .12s var(--ease);
+}
+.loadfield:hover{border-color:var(--line-mid)}
+.loadfield .ic{color:var(--ink-4)}
+.lf-txt{min-width:0;display:flex;flex-direction:column;justify-content:center;gap:2px}
+.lf-txt b{
+  font-family:var(--mono);font-size:12.5px;font-weight:500;color:var(--ink);
+  white-space:nowrap;overflow:hidden;text-overflow:ellipsis;
+}
+.lf-txt b.ph{color:var(--ink-4);font-weight:400}
+.lf-txt span{
+  font-size:11px;color:var(--ink-4);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;
+  font-variant-numeric:tabular-nums;
+}
+.loadbar .btn{height:52px;padding:0 18px;border-radius:9px}
+
+/* 最近文件 */
+/* 最近 5 条固定一行：每颗等分剩余宽度，名字超长省略（悬停看完整路径） */
+.recent{display:flex;flex-wrap:nowrap;align-items:center;gap:6px;margin-top:10px;min-height:26px}
+.recent .lb{flex:0 0 auto;font-size:11px;color:var(--ink-4);margin-right:2px}
+.rchip{
+  display:inline-flex;align-items:center;gap:6px;height:26px;padding:0 9px;
+  flex:1 1 0;min-width:0;max-width:340px;
+  border-radius:6px;border:1px solid var(--line);background:transparent;
+  font-family:var(--mono);font-size:11px;color:var(--ink-3);
+  transition:background-color .12s var(--ease),border-color .12s var(--ease),color .12s var(--ease);
+}
+.rchip:hover{background:var(--panel);border-color:var(--line-mid);color:var(--ink-2)}
+.rchip.on{background:var(--panel);border-color:var(--ink-3);color:var(--ink)}
+.rchip .nm{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+
+.hint{margin:10px 0 0;font-size:11.5px;color:var(--ink-4);line-height:1.7}
+.hint b{color:var(--ink-3);font-weight:500}
+
+/* ============================================================ 表单 */
+.grid5{display:grid;grid-template-columns:repeat(5,minmax(0,1fr));gap:16px;margin-top:20px}
+.fld{display:flex;flex-direction:column;gap:6px;min-width:0}
+.fld>label{font-size:12px;font-weight:500;color:var(--ink-2);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.desc{margin:0;font-size:11px;color:var(--ink-4);line-height:1.55}
+.sel{
+  height:34px;width:100%;padding:0 10px;border-radius:7px;min-width:0;
+  background:var(--panel);border:1px solid var(--line);color:var(--ink);
+  font-size:12.5px;outline:none;
+  transition:border-color .12s var(--ease),box-shadow .12s var(--ease);
+}
+.sel::placeholder{color:var(--ink-4)}
+.sel:hover{border-color:var(--line-mid)}
+.sel:focus{border-color:var(--ink-3);box-shadow:0 0 0 3px var(--accent-bg)}
+select.sel{appearance:none;cursor:pointer;padding-right:26px;background-image:var(--chev);background-repeat:no-repeat;background-position:right 9px center}
+select.sel option{background:var(--panel);color:var(--ink)}
+.row{display:flex;gap:6px;min-width:0}
+.icon-sq{
+  width:34px;height:34px;flex:0 0 auto;border-radius:7px;display:grid;place-items:center;
+  background:var(--panel);border:1px solid var(--line);color:var(--ink-3);
+  transition:background-color .12s var(--ease),border-color .12s var(--ease),color .12s var(--ease);
+}
+.icon-sq:hover{background:var(--sunken);border-color:var(--line-mid);color:var(--ink)}
+.icon-sq .ic{width:15px;height:15px}
+code{font-family:var(--mono);font-size:.94em;color:var(--ink-2);background:var(--sunken);padding:1px 4px;border-radius:3px}
+
+/* ============================================================ 卡片 */
+.card{
+  margin-top:16px;padding:18px 20px;border-radius:11px;
+  background:var(--panel);border:1px solid var(--line);
+}
+.card-head{display:flex;align-items:flex-start;justify-content:space-between;gap:20px;margin-bottom:14px}
+.card-head h2{margin:0;font-size:13.5px;font-weight:600;color:var(--ink);letter-spacing:-.005em}
+.card-head p{margin:3px 0 0;font-size:11.5px;color:var(--ink-4);font-variant-numeric:tabular-nums}
+.card-head .sub{font-size:11.5px;color:var(--ink-4);white-space:nowrap}
+
+/* 仪表读数 */
+.figure{text-align:right;line-height:1;flex:0 0 auto}
+.figure b{font-family:var(--mono);font-size:30px;font-weight:400;letter-spacing:-.03em;color:var(--accent-ink)}
+.figure i{font-style:normal;font-family:var(--mono);font-size:13px;color:var(--ink-4);margin-left:1px}
+.figure span{display:block;margin-top:6px;font-size:11px;color:var(--ink-4)}
+
+/* ============================================================ 切段刻度带（主角） */
+.strip{
+  position:relative;height:54px;border-radius:5px;overflow:hidden;
+  background:var(--track);box-shadow:inset 0 0 0 1px var(--line);
+  cursor:crosshair;
+}
+.strip.big{height:104px}
+.strip-grid{
+  position:absolute;inset:0;pointer-events:none;
+  background-image:linear-gradient(90deg,var(--line) 0 1px,transparent 1px);
+  background-size:25% 100%;background-position:0 0;
+}
+.strip .seg{position:absolute;top:0;bottom:0;min-width:1px;display:block;cursor:crosshair;transition:background-color .1s linear;box-shadow:inset -1px 0 0 var(--track)}
+.strip .seg.s{background:var(--seg)}
+.strip .seg.d{background:var(--accent)}
+.strip .seg.s:hover{background:var(--seg-hi)}
+.strip .seg.d:hover{background:var(--accent-ink)}
+.strip-empty{position:absolute;inset:0;display:grid;place-items:center;font-size:11.5px;color:var(--ink-4)}
+.ticks{display:flex;justify-content:space-between;margin-top:6px;font-family:var(--mono);font-size:10.5px;color:var(--ink-4);font-variant-numeric:tabular-nums}
+.strip-foot{display:flex;align-items:baseline;justify-content:space-between;gap:16px;margin-top:10px;flex-wrap:wrap}
+.legend{display:flex;align-items:center;gap:14px;font-size:11.5px;color:var(--ink-3)}
+.legend i{display:inline-block;width:8px;height:8px;border-radius:1.5px;margin-right:6px;vertical-align:0}
+.readout{
+  font-family:var(--mono);font-size:11.5px;color:var(--ink-3);white-space:nowrap;
+  font-variant-numeric:tabular-nums;
+}
+.readout b{font-weight:500;color:var(--ink)}
+.readout .d{color:var(--accent-ink)}
+
+/* 预设 */
+.preset-row{display:flex;align-items:center;gap:8px;margin-top:16px;flex-wrap:wrap}
+.preset-row .lb{font-size:11.5px;color:var(--ink-4);margin-right:2px}
+.preset{
+  display:inline-flex;align-items:center;gap:7px;height:30px;padding:0 11px;
+  border-radius:6px;border:1px solid var(--line);background:transparent;
+  transition:background-color .12s var(--ease),border-color .12s var(--ease),color .12s var(--ease);
+}
+.preset b{font-size:12px;font-weight:500;line-height:16px;color:var(--ink-2)}
+.preset span{font-family:var(--mono);font-size:11px;line-height:16px;color:var(--ink-4)}
+.preset:hover{background:var(--panel);border-color:var(--line-mid)}
+.preset:hover b{color:var(--ink)}
+.preset.on{background:var(--panel);border-color:var(--ink-3)}
+.preset.on b{color:var(--ink)}
+.preset.on span{color:var(--ink-3)}
+
+/* 高级选项 */
+.adv{margin-top:16px;border-top:1px solid var(--line-soft)}
+.adv summary{
+  list-style:none;cursor:pointer;display:flex;align-items:center;gap:8px;
+  padding:13px 0 0;font-size:12.5px;font-weight:500;color:var(--ink-2);
+}
+.adv summary::-webkit-details-marker{display:none}
+.adv summary .cv{width:9px;height:9px;border-right:1.3px solid var(--ink-4);border-bottom:1.3px solid var(--ink-4);transform:rotate(-45deg);transition:transform .15s var(--ease);margin-left:1px}
+.adv[open] summary .cv{transform:rotate(45deg)}
+.adv summary em{font-style:normal;font-weight:400;font-size:11.5px;color:var(--ink-4)}
+.adv-hint{margin-left:auto;font-family:var(--mono);font-size:11px;color:var(--ink-4);font-weight:400;white-space:nowrap}
+.adv-body{padding-top:16px;display:grid;grid-template-columns:minmax(0,1fr);gap:18px}
+.grid2{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:16px 24px}
+/* 开关组：7 项一行铺满整行，间距均分（首尾贴到卡片左右边，剩余宽度平分给 6 个间隙）。
+   每项宽度仍由内容决定、标签后 8px 紧跟滑块，配对关系不变。
+   注意：间距随窗口宽度变，所以拉窗口时横向位置会跟着动 —— 这是「铺满整行」的必然结果。 */
+.toggles{display:flex;flex-wrap:nowrap;align-items:center;justify-content:space-between;gap:12px}
+.sw{display:flex;align-items:center;justify-content:flex-start;gap:8px;min-width:0;cursor:pointer;user-select:none;padding:4px 0}
+.sw span{font-size:12px;color:var(--ink-3);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;transition:color .12s var(--ease)}
+.sw:hover span{color:var(--ink-2)}
+.sw .knob{position:relative;flex:0 0 auto;width:30px;height:17px;border-radius:9px;background:var(--line-mid);transition:background-color .15s var(--ease)}
+.sw .knob::after{content:"";position:absolute;top:2px;left:2px;width:13px;height:13px;border-radius:50%;background:var(--sw-knob);box-shadow:var(--sw-sh);transition:transform .15s var(--ease)}
+.sw.on span{color:var(--ink)}
+.sw.on .knob{background:var(--sw-on)}
+.sw.on .knob::after{transform:translateX(13px)}
+
+/* ============================================================ 数据 */
+.facts{display:grid;grid-template-columns:1.5fr 1fr 1fr 1fr;gap:1px;margin-top:16px;grid-auto-flow:row;background:var(--line);border:1px solid var(--line);border-radius:10px;overflow:hidden}
+.fact{background:var(--panel);padding:12px 16px;display:flex;flex-direction:column;gap:5px;min-width:0}
+.fact .fk{font-size:11px;color:var(--ink-4);white-space:nowrap}
+.fact b{font-family:var(--mono);font-size:17px;font-weight:400;color:var(--ink);letter-spacing:-.01em;font-variant-numeric:tabular-nums}
+.fact.main b{font-size:27px;letter-spacing:-.03em;color:var(--accent-ink)}
+.fact .fs{font-size:11px;color:var(--ink-4);white-space:nowrap}
+
+/* 表格 */
+.tblwrap{max-height:clamp(220px,calc(100vh - 430px),540px);overflow:auto;margin:0 -20px -18px;padding:0}
+table.tbl{width:100%;border-collapse:collapse;font-size:12px;table-layout:fixed}
+.tbl th{
+  position:sticky;top:0;z-index:1;text-align:left;white-space:nowrap;
+  padding:9px 12px;font-size:11px;font-weight:500;color:var(--ink-4);
+  background:var(--panel);border-bottom:1px solid var(--line);
+}
+.tbl td{padding:7px 12px;border-bottom:1px solid var(--line-soft);color:var(--ink-2);vertical-align:middle}
+.tbl tbody tr:hover td{background:var(--hover)}
+.tbl tbody tr:last-child td{border-bottom:none}
+.tbl .r{text-align:right}
+.tbl .c-num{color:var(--ink-4);font-family:var(--mono);font-size:11px}
+.tbl .c-tc{font-family:var(--mono);font-size:11.5px;color:var(--ink-2);font-variant-numeric:tabular-nums}
+.tbl .c-type{font-size:11.5px;color:var(--ink-3)}
+.tbl tr.dyn .c-type{color:var(--accent-ink)}
+/* 段条：宽度＝该段帧数占比，唯一的每行图形 */
+.sbar{display:block;height:4px;background:var(--sunken);border-radius:1px;overflow:hidden}
+.sbar i{display:block;height:100%;background:var(--seg-hi);border-radius:1px}
+.sbar.d i{background:var(--accent)}
+
+/* ============================================================ 进度 / 日志 */
+.prog-head{display:flex;align-items:flex-end;justify-content:space-between;gap:20px;margin-bottom:14px}
+.pct{font-family:var(--mono);font-size:40px;font-weight:400;line-height:.85;color:var(--ink);letter-spacing:-.04em;font-variant-numeric:tabular-nums}
+.pct small{font-size:14px;color:var(--ink-4);margin-left:2px;letter-spacing:0}
+.stage-txt{text-align:right;line-height:1.6}
+.stage-txt b{display:block;font-size:12.5px;font-weight:500;color:var(--ink)}
+.stage-txt span{font-size:11.5px;color:var(--ink-4);font-variant-numeric:tabular-nums}
+.bar-wrap{height:3px;border-radius:2px;background:var(--sunken);overflow:hidden}
+.bar{height:100%;width:0;background:var(--accent);transition:width .3s var(--ease)}
+.run-actions{display:flex;align-items:center;gap:8px;margin-top:16px;flex-wrap:wrap}
+.console-head{display:flex;align-items:center;gap:8px;margin:18px 0 8px;font-size:11px;color:var(--ink-4)}
+.console-head .d{width:6px;height:6px;border-radius:50%;background:var(--line-mid);flex:0 0 auto}
+.console-head .d.live{background:var(--accent)}
+.console-head .sp{flex:1}
+.console-head .cnt{font-family:var(--mono);font-variant-numeric:tabular-nums}
+pre.log{
+  margin:0;padding:12px 14px;height:clamp(220px,calc(100vh - 420px),460px);
+  overflow:auto;border-radius:8px;background:var(--sunken);border:1px solid var(--line-soft);
+  font-family:var(--mono);font-size:11.5px;line-height:1.7;color:var(--ink-2);
+  white-space:pre-wrap;word-break:break-word;font-variant-numeric:tabular-nums;
+}
+pre.log .l-cmd{color:var(--accent-ink)}
+pre.log .l-err{color:var(--err)}
+pre.log .l-done{color:var(--ok)}
+pre.log .l-dim{color:var(--ink-3)}
+pre.log .ph{color:var(--ink-4)}
+
+/* ============================================================ 历史表 */
+.hist-head-actions{display:flex;align-items:center;gap:14px}
+table.htbl{width:calc(100% + 40px);border-collapse:collapse;font-size:12px;table-layout:fixed;margin:0 -20px}
+.htbl th{
+  text-align:left;white-space:nowrap;padding:9px 12px;
+  font-size:11px;font-weight:500;color:var(--ink-4);
+  border-bottom:1px solid var(--line);
+}
+.htbl th:first-child{padding-left:20px}
+.htbl th:last-child{padding-right:20px}
+.htbl td{padding:9px 12px;border-bottom:1px solid var(--line-soft);color:var(--ink-2);vertical-align:middle}
+.htbl td:first-child{padding-left:20px}
+.htbl td:last-child{padding-right:14px}
+.htbl .r{text-align:right}
+.htbl tbody tr{cursor:pointer}
+.htbl tbody tr:hover td{background:var(--hover)}
+.htbl tbody tr:last-child td{border-bottom:none}
+.htbl .c-time{font-family:var(--mono);font-size:11.5px;color:var(--ink-4);white-space:nowrap}
+.htbl .c-name{font-family:var(--mono);font-size:12px;color:var(--ink);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.htbl .c-num{font-family:var(--mono);font-size:11.5px;color:var(--ink-2);font-variant-numeric:tabular-nums;white-space:nowrap}
+.htbl .c-num.dim{color:var(--ink-4)}
+.htbl .c-spd{font-family:var(--mono);font-size:12px;color:var(--ink-2);white-space:nowrap}
+.htbl .c-act{text-align:right}
+.rowdel{
+  width:24px;height:24px;border-radius:5px;display:grid;place-items:center;
+  color:var(--ink-4);opacity:0;transition:opacity .12s var(--ease),background-color .12s var(--ease),color .12s var(--ease);
+}
+.rowdel .ic{width:13px;height:13px}
+.htbl tr:hover .rowdel{opacity:1}
+.rowdel:hover{background:var(--sunken);color:var(--err)}
+
+/* ============================================================ 环境 */
+.env-list{display:flex;flex-direction:column}
+.env-item{display:grid;grid-template-columns:10px 168px minmax(0,1fr);align-items:center;gap:12px;padding:11px 0;border-bottom:1px solid var(--line-soft)}
+.env-item:last-child{border-bottom:none}
+.env-item .nm{font-family:var(--mono);font-size:12px;color:var(--ink)}
+.env-item .dt{font-family:var(--mono);font-size:11.5px;color:var(--ink-4);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.st{width:7px;height:7px;border-radius:50%;background:var(--line-mid);flex:0 0 auto}
+.st.ok{background:var(--ok)}
+.st.bad{background:var(--err)}
+.env-state{font-family:var(--mono);font-size:11.5px;color:var(--ink-3);white-space:nowrap}
+.note{margin-top:18px;padding-top:16px;border-top:1px solid var(--line-soft);font-size:11.5px;line-height:1.9;color:var(--ink-3)}
+.note b{color:var(--ink-2);font-weight:500}
+
+/* ============================================================ 状态栏 */
+.statusbar{
+  position:fixed;left:0;right:0;bottom:0;z-index:80;height:34px;
+  display:flex;align-items:center;gap:9px;padding:0 20px;
+  background:var(--panel);border-top:1px solid var(--line);
+  font-size:11.5px;color:var(--ink-3);
+}
+.sb-dot{width:6px;height:6px;border-radius:50%;background:var(--line-mid);flex:0 0 auto;transition:background-color .2s var(--ease)}
+.sb-dot.run{background:var(--accent)}
+.sb-dot.ok{background:var(--ok)}
+.sb-dot.bad{background:var(--err)}
+.sb-text{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.sb-pct{font-family:var(--mono);color:var(--ink-2);font-variant-numeric:tabular-nums}
+.sb-right{margin-left:auto;display:flex;align-items:center;gap:12px;white-space:nowrap}
+.sb-chip{display:inline-flex;align-items:center;gap:6px}
+.sb-chip i{width:6px;height:6px;border-radius:50%;background:var(--line-mid)}
+.sb-chip.ok i{background:var(--ok)}
+.sb-chip.bad i{background:var(--err)}
+.sb-sep{width:1px;height:12px;background:var(--line)}
+.sb-prog{position:absolute;left:0;top:-1px;height:1px;width:0;background:var(--accent);transition:width .3s var(--ease)}
+
+/* ============================================================ toast */
+#toast{position:fixed;right:20px;bottom:46px;z-index:200;display:flex;flex-direction:column;gap:6px;align-items:flex-end;pointer-events:none}
+.toast{
+  display:flex;align-items:center;gap:8px;padding:9px 13px;border-radius:7px;max-width:420px;
+  background:var(--panel);border:1px solid var(--line);color:var(--ink-2);
+  font-size:12px;box-shadow:var(--sh-pop);
+  animation:tin .18s var(--ease);
+}
+.toast.err{border-color:var(--err);color:var(--err)}
+.toast.ok{border-color:var(--line-mid);color:var(--ink)}
+@keyframes tin{from{opacity:0;transform:translateY(4px)}to{opacity:1;transform:none}}
+
+/* 拖放 */
+body.dragging::after{
+  content:"松开即加载此字幕";position:fixed;inset:12px;z-index:300;
+  display:grid;place-items:center;border-radius:10px;
+  border:1px dashed var(--ink-4);background:var(--drag);
+  color:var(--ink-2);font-size:13px;
+  pointer-events:none;
+}
+
+/* 空状态 */
+.empty{padding:26px 0;text-align:center;font-size:12px;color:var(--ink-4)}
+
+@media(max-width:1120px){
+  .grid5{grid-template-columns:repeat(3,minmax(0,1fr))}
+  .facts{grid-template-columns:1fr 1fr}
+}
+/* 开关组一行排开，靠 flex-wrap 自己折行，不需要断点 */
+@media(max-width:820px){
+  .app{padding:18px 16px 56px}
+  .grid5,.grid2{grid-template-columns:minmax(0,1fr) minmax(0,1fr)}
+  .loadbar{grid-template-columns:1fr}
+  .loadbar .btn{height:40px}
+  .head{flex-wrap:wrap}
+  .env-item{grid-template-columns:10px 1fr;}
+  .env-item .dt{grid-column:2}
+}
+</style>
+</head>
+<body>
+
+<svg width="0" height="0" style="position:absolute" aria-hidden="true"><defs>
+  <symbol id="i-file" viewBox="0 0 24 24"><path d="M6.5 3.5h7.5l4 4v13H6.5z"/><path d="M14 3.5v4h4"/></symbol>
+  <symbol id="i-folder" viewBox="0 0 24 24"><path d="M3.5 6.5h5.5l1.8 2.2h9.7v10.8h-17z"/></symbol>
+  <symbol id="i-reset" viewBox="0 0 24 24"><path d="M19.5 12a7.5 7.5 0 1 1-2.4-5.5"/><path d="M19.8 4.2v5h-5"/></symbol>
+  <symbol id="i-monitor" viewBox="0 0 24 24"><rect x="3.5" y="4.8" width="17" height="11.4" rx="1.8"/><path d="M9 19.5h6M12 16.2v3.3"/></symbol>
+  <symbol id="i-sun" viewBox="0 0 24 24"><circle cx="12" cy="12" r="3.6"/><path d="M12 3.2v2M12 18.8v2M3.2 12h2M18.8 12h2M5.8 5.8l1.4 1.4M16.8 16.8l1.4 1.4M5.8 18.2l1.4-1.4M16.8 7.2l1.4-1.4"/></symbol>
+  <symbol id="i-moon" viewBox="0 0 24 24"><path d="M20 14.2A8.2 8.2 0 0 1 9.8 4 8.2 8.2 0 1 0 20 14.2z"/></symbol>
+  <symbol id="i-x" viewBox="0 0 24 24"><path d="M6 6l12 12M18 6L6 18"/></symbol>
+  <symbol id="i-plus" viewBox="0 0 24 24"><path d="M12 5.5v13M5.5 12h13"/></symbol>
+  <symbol id="i-minus" viewBox="0 0 24 24"><path d="M5.5 12h13"/></symbol>
+  <symbol id="i-square" viewBox="0 0 24 24"><rect x="5.5" y="5.5" width="13" height="13" rx="1.6"/></symbol>
+  <symbol id="i-play" viewBox="0 0 24 24"><path d="M8 5.5l10 6.5-10 6.5z"/></symbol>
+  <symbol id="i-open" viewBox="0 0 24 24"><path d="M13 5.5h5.5V11"/><path d="M18.5 5.5L11 13"/><path d="M18 14v4.5H5.5V6H10"/></symbol>
+</defs></svg>
+
+<!-- ================= 标题栏 ================= -->
+<div class="titlebar" id="topbar" data-tauri-drag-region>
+  <div class="tb-left">
+    <span class="mark" aria-hidden="true"><i></i><i></i><i></i><i></i></span>
+    <b>supfast</b>
+    <span class="tb-sep"></span>
+    <span class="tb-spec">ASS → PGS</span>
+  </div>
+  <div class="tb-right">
+    <button class="tb-btn no-drag" id="dotMin" title="最小化"><svg class="ic"><use href="#i-minus"/></svg></button>
+    <button class="tb-btn no-drag" id="dotMax" title="最大化 / 还原"><svg class="ic"><use href="#i-square"/></svg></button>
+    <button class="tb-btn close no-drag" id="dotClose" title="关闭"><svg class="ic"><use href="#i-x"/></svg></button>
+  </div>
+</div>
+
+<div class="app">
+
+  <!-- ================= 页头 ================= -->
+  <header class="head">
+    <div>
+      <h1>supfast</h1>
+      <p>把 ASS / SSA 字幕按画面变化切段，只渲染必要的帧，输出 PGS <code>.sup</code> 与 BDN <code>.xml</code></p>
+    </div>
+    <div class="head-actions">
+      <button class="spec-btn" id="presetBtn" title="跳转到输出规格"><span id="presetTxt">23.976 · 1080p</span></button>
+      <button class="icon-btn" id="btnReset" title="恢复默认设置"><svg class="ic"><use href="#i-reset"/></svg></button>
+      <div class="seg-ctl" id="themeCtl" role="group" aria-label="主题">
+        <button data-mode="auto" title="跟随系统"><svg class="ic"><use href="#i-monitor"/></svg></button>
+        <button data-mode="light" title="浅色"><svg class="ic"><use href="#i-sun"/></svg></button>
+        <button data-mode="dark" title="深色"><svg class="ic"><use href="#i-moon"/></svg></button>
+      </div>
+    </div>
+  </header>
+
+  <!-- ================= 标签页 ================= -->
+  <nav class="tabs" id="tabs">
+    <button class="tab on" data-pane="convert">转换</button>
+    <button class="tab" data-pane="timeline">切段计划</button>
+    <button class="tab" data-pane="history">历史<span class="tcount" id="tabHistCount"></span></button>
+    <button class="tab" data-pane="env">环境</button>
+    <button class="tab" data-pane="log">日志</button>
+  </nav>
+
+  <!-- ================= 01 转换 ================= -->
+  <section class="pane on" id="pane-convert">
+
+    <div class="loadbar">
+      <div class="loadfield">
+        <svg class="ic"><use href="#i-file"/></svg>
+        <div class="lf-txt">
+          <b id="fileText" class="ph">未选择文件</b>
+          <span id="fileMeta">拖入 .ass 或 .ssa</span>
+        </div>
+      </div>
+      <button class="btn" id="btnPick"><svg class="ic"><use href="#i-folder"/></svg>选择文件</button>
+      <button class="btn primary" id="btnRun" disabled>开始转换</button>
+    </div>
+
+    <div class="recent" id="rail"></div>
+
+    <p class="hint">整条时间线按「画面是否恒定」切成段：恒定段只渲染段首一帧，<b>含 <code>\move</code> <code>\t()</code> <code>\fad</code> <code>\k</code> 的段逐帧渲染</b>。</p>
+
+    <div class="grid5">
+      <div class="fld">
+        <label>帧率 FPS</label>
+        <select class="sel" id="fps">
+          <option value="23.976">23.976 film</option>
+          <option value="24">24</option>
+          <option value="25">25 PAL</option>
+          <option value="29.97">29.97 NTSC</option>
+          <option value="30">30</option>
+          <option value="50">50</option>
+          <option value="59.94">59.94</option>
+        </select>
+        <p class="desc">需与视频一致</p>
+      </div>
+      <div class="fld">
+        <label>VideoFormat</label>
+        <select class="sel" id="vfmt">
+          <option value="1080p">1080p</option>
+          <option value="1080i">1080i</option>
+          <option value="720p">720p</option>
+          <option value="576i">576i</option>
+          <option value="480p">480p</option>
+          <option value="480i">480i</option>
+        </select>
+        <p class="desc">写进 PGS 显示描述符</p>
+      </div>
+      <div class="fld">
+        <label>语言码</label>
+        <input class="sel" id="lang" list="langList" placeholder="chi / zho / eng">
+        <datalist id="langList">
+          <option value="zho">zho 中文</option>
+          <option value="chi">chi 中文（旧）</option>
+          <option value="eng">eng 英语</option>
+          <option value="jpn">jpn 日语</option>
+          <option value="und">und 未定义</option>
+        </datalist>
+        <p class="desc">PGS 轨道语言标签</p>
+      </div>
+      <div class="fld">
+        <label>轨道名</label>
+        <input class="sel" id="title" placeholder="Undefined">
+        <p class="desc">播放器里显示的轨道名</p>
+      </div>
+      <div class="fld">
+        <label>并行度</label>
+        <input class="sel" id="jobs" type="number" min="1" max="64" step="1">
+        <p class="desc">建议等于 CPU 核心数</p>
+      </div>
+    </div>
+
+    <!-- 切段计划 -->
+    <div class="card">
+      <div class="card-head">
+        <div>
+          <h2>切段计划</h2>
+          <p id="tlTitle">尚未分析</p>
+        </div>
+        <div class="figure"><b id="bigPct">—</b><i>%</i><span>需渲染帧占比</span></div>
+      </div>
+
+      <div class="strip" id="tl"><div class="strip-empty">选择字幕后在这里显示切段</div></div>
+      <div class="ticks"><span id="tl0">00:00:00:00</span><span id="tl1"></span><span id="tl2"></span></div>
+
+      <div class="strip-foot">
+        <div class="legend">
+          <span><i style="background:var(--seg)"></i>静态段 · 只渲段首帧</span>
+          <span><i style="background:var(--accent)"></i>动态段 · 逐帧</span>
+        </div>
+        <div class="readout" id="tlRead">—</div>
+      </div>
+
+      <div class="preset-row" id="presets">
+        <span class="lb">预设</span>
+        <button class="preset" data-fps="23.976" data-vfmt="1080p"><b>蓝光</b><span>23.976 · 1080p</span></button>
+        <button class="preset" data-fps="25" data-vfmt="1080p"><b>PAL 高清</b><span>25 · 1080p</span></button>
+        <button class="preset" data-fps="25" data-vfmt="480p"><b>DVD</b><span>25 · 480p</span></button>
+        <button class="preset" data-fps="29.97" data-vfmt="1080i"><b>电视</b><span>29.97 · 1080i</span></button>
+      </div>
+    </div>
+
+    <div class="fld" style="margin-top:16px">
+      <label>输出目录</label>
+      <div class="row">
+        <input class="sel" id="outdir" placeholder="留空 = <字幕目录>/<字幕名>/">
+        <button class="icon-sq" id="btnPickOut" title="浏览"><svg class="ic"><use href="#i-folder"/></svg></button>
+      </div>
+      <p class="desc">生成 <code>&lt;字幕名&gt;.xml</code>（BDN）与 <code>&lt;字幕名&gt;.sup</code>（PGS）</p>
+    </div>
+
+    <details class="adv" id="adv">
+      <summary><span class="cv"></span>高级选项 <em>分辨率覆盖 / 合成参数</em><span class="adv-hint" id="advHint">默认即可</span></summary>
+      <div class="adv-body">
+        <div class="grid2">
+          <div class="fld">
+            <label>分辨率覆盖</label>
+            <div class="row">
+              <input class="sel" id="w" type="number" placeholder="宽（留空 = ASS）">
+              <input class="sel" id="h" type="number" placeholder="高（留空 = ASS）">
+            </div>
+            <p class="desc">默认使用 ASS 里声明的 PlayResX / PlayResY</p>
+          </div>
+          <div class="fld">
+            <label>mod 目录</label>
+            <div class="row">
+              <input class="sel" id="modRoot" placeholder="留空 = 自动查找">
+              <button class="icon-sq" id="btnPickMod" title="浏览"><svg class="ic"><use href="#i-folder"/></svg></button>
+            </div>
+            <p class="desc">含 <code>avs2bdnxml.exe</code> 与 <code>csri\VSFilterMod.dll</code></p>
+          </div>
+        </div>
+        <div class="toggles" id="toggles">
+          <div class="sw on" data-k="palette"><span>8bit 调色板 PNG</span><i class="knob"></i></div>
+          <div class="sw on" data-k="autocrop"><span>自动裁剪</span><i class="knob"></i></div>
+          <div class="sw on" data-k="bufsplit"><span>PG 缓冲优化</span><i class="knob"></i></div>
+          <div class="sw" data-k="stricter"><span>严格模式 -z</span><i class="knob"></i></div>
+          <div class="sw" data-k="even_y"><span>强制偶数 Y</span><i class="knob"></i></div>
+          <div class="sw" data-k="no_sup"><span>不生成 SUP</span><i class="knob"></i></div>
+          <div class="sw" data-k="dry_run"><span>只看计划</span><i class="knob"></i></div>
+        </div>
+      </div>
+    </details>
+  </section>
+
+  <!-- ================= 02 切段计划 ================= -->
+  <section class="pane" id="pane-timeline">
+    <div class="card" style="margin-top:0">
+      <div class="card-head">
+        <div>
+          <h2>切段时间轴</h2>
+          <p id="tlTitle2">尚未分析</p>
+        </div>
+        <div class="figure"><b id="bigPct2">—</b><i>%</i><span>需渲染帧占比</span></div>
+      </div>
+      <div class="strip big" id="tlBig"><div class="strip-empty">选择字幕后在这里显示切段</div></div>
+      <div class="ticks"><span id="tl0b">00:00:00:00</span><span id="tl1b"></span><span id="tl2b"></span></div>
+      <div class="strip-foot">
+        <div class="legend">
+          <span><i style="background:var(--seg)"></i>静态段</span>
+          <span><i style="background:var(--accent)"></i>动态段</span>
+          <span style="color:var(--ink-4)">轨道底色 = 无字幕</span>
+        </div>
+        <div class="readout" id="tlRead2">—</div>
+      </div>
+    </div>
+
+    <div class="facts">
+      <div class="fact main"><span class="fk">需渲染</span><b id="stWork">—</b><span class="fs" id="stWorkSub">帧</span></div>
+      <div class="fact"><span class="fk">事件</span><b id="stEvents">—</b></div>
+      <div class="fact"><span class="fk">切段</span><b id="stSegs">—</b></div>
+      <div class="fact"><span class="fk">较原版</span><b id="stSpeed">—</b></div>
+    </div>
+
+    <div class="card">
+      <div class="card-head">
+        <div><h2>段列表</h2><p>每段独立调用一次 avs2bdnxml</p></div>
+        <div class="sub" id="segCount"></div>
+      </div>
+      <div class="tblwrap" id="segTbl"><div class="empty">暂无数据</div></div>
+    </div>
+  </section>
+
+  <!-- ================= 03 转换历史 ================= -->
+  <section class="pane" id="pane-history">
+    <div class="card" style="margin-top:0">
+      <div class="card-head">
+        <div><h2>转换历史</h2><p>点一行打开输出目录</p></div>
+        <div class="hist-head-actions">
+          <span class="sub" id="histCount"></span>
+          <button class="linkbtn" id="btnClearHist">清空记录</button>
+        </div>
+      </div>
+      <div id="histRow"></div>
+    </div>
+  </section>
+
+  <!-- ================= 04 环境自检 ================= -->
+  <section class="pane" id="pane-env">
+    <div class="card" style="margin-top:0">
+      <div class="card-head">
+        <div><h2>依赖自检</h2><p id="envHint">渲染链路需要的组件</p></div>
+        <div class="env-state" id="envHead"></div>
+      </div>
+      <div class="env-list" id="envGrid"></div>
+      <div class="note">
+        <b>原理</b>：原版 avs2bdnxml 每帧都要向 AviSynth 要一张全分辨率 RGBA 图（约 3~4 ms/帧），与画面有没有变化无关。
+        supfast 先解析 ASS 时间轴，把整条时间线切成「画面恒定段」与「画面变化段」：恒定段只渲染段首一帧整段共用，变化段逐帧渲染。
+        最后按 ASS 真实时间码重写 BDN XML，并把 PGS 的 PTS 重映射回真实时间。<br>
+        <b>注意</b>：切段按「画面内容变化」切 —— 每一句新字幕都会单独成段，时间首尾相接的不同台词不会被合并，所以产出的 PNG 张数约等于字幕条数。
+        每段独立调用一次 avs2bdnxml（约 230 ms 固定开销），段数上万时加速比会下降，上限 20000 段。<br>
+        <b>依赖</b>：本机需安装 AviSynth 2.5/2.6，渲染引擎由 mod 目录里的 <code>avs2bdnxml.exe</code> + <code>csri\VSFilterMod.dll</code> 提供。
+      </div>
+    </div>
+  </section>
+
+  <!-- ================= 05 运行日志 ================= -->
+  <section class="pane" id="pane-log">
+    <div class="card" style="margin-top:0">
+      <div class="prog-head">
+        <div class="pct"><span id="pctNum">0</span><small>%</small></div>
+        <div class="stage-txt"><b id="stageName">空闲</b><span id="stageSub">等待开始</span></div>
+      </div>
+      <div class="bar-wrap"><div class="bar" id="bar"></div></div>
+
+      <div class="run-actions">
+        <button class="btn primary" id="btnRun2" disabled><svg class="ic"><use href="#i-play"/></svg>开始转换</button>
+        <button class="btn" id="btnCancel" disabled>取消</button>
+        <button class="btn" id="btnOpenOut" disabled><svg class="ic"><use href="#i-open"/></svg>打开输出目录</button>
+      </div>
+
+      <div class="console-head">
+        <span class="d" id="logDot"></span><span>日志</span><span class="sp"></span><span class="cnt" id="logCount">0 行</span>
+      </div>
+      <pre class="log" id="log"><span class="ph">（等待任务）</span></pre>
+    </div>
+  </section>
+
+</div>
+
+<!-- ================= 状态栏 ================= -->
+<footer class="statusbar">
+  <i class="sb-dot" id="sbDot"></i>
+  <span class="sb-text" id="sbText">未加载字幕</span>
+  <span class="sb-pct" id="sbPct"></span>
+  <span class="sb-right">
+    <span class="sb-chip" id="chipEnvChip"><i></i><span id="chipEnvText">环境检测中</span></span>
+    <span class="sb-sep"></span>
+    <span class="mono" id="ftUrl">—</span>
+  </span>
+  <div class="sb-prog" id="sbProg"></div>
+</footer>
+
+<div id="toast"></div>
+
+<script>
+/* ============================ 工具 ============================ */
+const $ = (s, r=document) => r.querySelector(s);
+const $$ = (s, r=document) => Array.from(r.querySelectorAll(s));
+// Electron：走 preload 暴露的 IPC 桥（不能叫 api —— 会和 contextBridge 暴露的
+// 全局 window.api 撞名，全局 const 声明会直接抛 "already declared"）
+const T = window.__TAURI__;
+const rpc = (path, body) => T.core.invoke('api', { path, body: body || {} });
+const appWindow = T.window.getCurrentWindow();
+const esc = s => String(s??'').replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+const fmtN = n => (n??0).toLocaleString('en-US');
+const pad = n => String(n).padStart(2,'0');
+// 同一个文件可能以 H:/a/b.ass 或 H://a//b.ass 两种写法出现，比较前统一
+const norm = p => String(p||'').replace(/[\\/]+/g,'/').replace(/\/+$/,'').toLowerCase();
+
+/* 全站唯一的时间码格式：HH:MM:SS:FF —— 最后一格是帧，不是百分秒 */
+const tcOf = (sec, fps) => {
+  const f = Math.max(0, Math.floor(sec * (fps || 24) + 1e-6));
+  const fp = Math.round(fps || 24) || 24;
+  return [pad(Math.floor(f / (fp * 3600))), pad(Math.floor(f / (fp * 60)) % 60),
+          pad(Math.floor(f / fp) % 60), pad(f % fp)].join(':');
+};
+const mb = b => b >= 1048576 ? (b/1048576).toFixed(1) + ' MB'
+             : b >= 1024 ? Math.round(b/1024) + ' KB' : (b ? b + ' B' : '—');
+
+function toast(msg, kind=''){
+  const el = document.createElement('div');
+  el.className = 'toast ' + kind;
+  el.textContent = msg;
+  $('#toast').appendChild(el);
+  setTimeout(()=>{ el.style.transition='opacity .2s,transform .2s';
+    el.style.opacity='0'; el.style.transform='translateY(4px)';
+    setTimeout(()=>el.remove(), 220); }, kind==='err'?5200:2600);
+}
+
+/* ============================ 主题 ============================ */
+const THEME_MODES = ['auto', 'light', 'dark'];
+const mqDark = matchMedia('(prefers-color-scheme: dark)');
+let themeMode = 'auto';
+
+function resolveTheme(){
+  return themeMode === 'auto' ? (mqDark.matches ? 'dark' : 'light') : themeMode;
+}
+function applyTheme(mode, persist){
+  if (THEME_MODES.includes(mode)) themeMode = mode;
+  document.documentElement.dataset.theme = resolveTheme();
+  document.documentElement.dataset.themeMode = themeMode;
+  $$('#themeCtl [data-mode]').forEach(b => b.classList.toggle('on', b.dataset.mode === themeMode));
+  if (persist) saveSettings();
+}
+mqDark.addEventListener('change', () => { if (themeMode === 'auto') applyTheme('auto'); });
+$$('#themeCtl [data-mode]').forEach(b => b.onclick = () => applyTheme(b.dataset.mode, true));
+
+/* ============================ 状态 ============================ */
+const S = {
+  ass: '', info: null, running: false, seq: 0,
+  modDir: '', env: [], history: [], recent: [], logLines: 0, noteKey: '',
+  bands: [], total: 1, fps: 24,
+};
+
+/* ============================ 标签页 ============================ */
+const PANES = ['convert','timeline','history','env','log'];
+function showPane(k){
+  if (!PANES.includes(k)) return;
+  $$('.tab').forEach(t => t.classList.toggle('on', t.dataset.pane === k));
+  $$('.pane').forEach(p => p.classList.toggle('on', p.id === 'pane-' + k));
+  scrollTo({top:0, behavior:'smooth'});
+}
+$$('.tab').forEach(t => t.onclick = () => showPane(t.dataset.pane));
+
+/* ============================ 设置读写 ============================ */
+const FIELDS = ['fps','vfmt','lang','title','jobs','outdir','w','h','modRoot'];
+const TOGGLES = ['palette','autocrop','bufsplit','stricter','even_y','no_sup','dry_run'];
+
+function readForm(){
+  const o = {ass:S.ass, fps:$('#fps').value, vfmt:$('#vfmt').value,
+    lang:$('#lang').value.trim() || 'und', title:$('#title').value.trim() || 'Undefined',
+    jobs:+$('#jobs').value || 4, outdir:$('#outdir').value.trim(), mod_root:$('#modRoot').value.trim(),
+    theme:themeMode};
+  TOGGLES.forEach(k => o[k] = $(`.sw[data-k="${k}"]`).classList.contains('on') ? 1 : 0);
+  o.width = +$('#w').value || 0;
+  o.height = +$('#h').value || 0;
+  return o;
+}
+
+function applySettings(st){
+  if (!st) return;
+  if (st.fps) $('#fps').value = String(st.fps);
+  if (![...$('#fps').options].some(o=>o.value===String(st.fps))){
+    const o = new Option(String(st.fps), String(st.fps)); $('#fps').append(o); $('#fps').value = String(st.fps);
+  }
+  if (st.vfmt) $('#vfmt').value = st.vfmt;
+  $('#lang').value = st.lang ?? 'zho';
+  $('#title').value = st.title ?? 'Undefined';
+  $('#jobs').value = st.jobs ?? 8;
+  $('#outdir').value = st.outdir ?? '';
+  $('#modRoot').value = st.mod_root ?? '';
+  $('#w').value = st.width || '';
+  $('#h').value = st.height || '';
+  TOGGLES.forEach(k => {
+    const on = String(st[k] ?? (k==='palette'||k==='autocrop'||k==='bufsplit' ? 1 : 0)) === '1';
+    $(`.sw[data-k="${k}"]`).classList.toggle('on', on);
+  });
+  syncPreset();
+}
+
+function syncPreset(){
+  const f = $('#fps').value, v = $('#vfmt').value;
+  $('#presetTxt').textContent = `${f} · ${v}`;
+  $$('.preset').forEach(p => p.classList.toggle('on', p.dataset.fps === f && p.dataset.vfmt === v));
+}
+
+$$('.sw').forEach(sw => sw.onclick = () => {
+  sw.classList.toggle('on');
+  saveSettings();
+  if (S.ass) analyze();
+});
+
+$$('.preset').forEach(p => p.onclick = () => {
+  $('#fps').value = p.dataset.fps;
+  $('#vfmt').value = p.dataset.vfmt;
+  syncPreset(); saveSettings();
+  if (S.ass) analyze();
+});
+
+FIELDS.forEach(id => {
+  const el = $('#' + id);
+  el.addEventListener('change', () => { syncPreset(); saveSettings(); if (S.ass) analyze(); });
+  if (['lang','title','outdir','modRoot','w','h'].includes(id))
+    el.addEventListener('keydown', e => { if (e.key === 'Enter'){ el.blur(); if (S.ass) analyze(); } });
+});
+
+let saveTimer = null;
+function saveSettings(){
+  clearTimeout(saveTimer);
+  saveTimer = setTimeout(async () => {
+    const o = readForm();
+    const res = await rpc('/api/settings', {settings:o});
+    if (res.env){ S.env = res.env; S.modDir = res.mod_dir; renderEnv(); }
+  }, 300);
+}
+
+/* ============================ 环境 ============================ */
+function renderEnv(){
+  const g = $('#envGrid');
+  g.innerHTML = (S.env||[]).map(e => `
+    <div class="env-item">
+      <i class="st ${e.ok?'ok':'bad'}"></i>
+      <div class="nm">${esc(e.name)}</div>
+      <div class="dt" title="${esc(e.detail)}">${esc(e.detail)}</div>
+    </div>`).join('');
+
+  const bad = (S.env||[]).filter(e => !e.ok && ['avs2bdnxml','vfilter','vsfilter','avisynth'].includes(e.key));
+  const chip = $('#chipEnvChip');
+  chip.className = 'sb-chip ' + (bad.length ? 'bad' : 'ok');
+  $('#chipEnvText').textContent = bad.length ? `环境缺失 ${bad.length} 项` : '环境就绪';
+  chip.title = (S.env||[]).map(e => `${e.ok?'✓':'✗'} ${e.name}: ${e.detail}`).join('\n');
+  if ($('#envHint')) {
+    $('#envHint').textContent = bad.length ? `有 ${bad.length} 项缺失，转换会失败` : '渲染链路需要的组件';
+  }
+  const total = (S.env || []).length;
+  const head = $('#envHead');
+  if (head) head.textContent = total ? (bad.length ? `缺失 ${bad.length} / ${total}` : `全部就绪 ${total} / ${total}`) : '';
+}
+
+/* ============================ 最近文件 ============================ */
+function renderRail(){
+  const rail = $('#rail');
+  // 只显示最近 5 条（后端保留 12 条，界面上不铺满一行）
+  const items = S.recent.slice(0, 5).map(r => `
+    <button class="rchip ${norm(r.path)===norm(S.ass)?'on':''}" data-path="${esc(r.path)}" title="${esc(r.path)}">
+      <span class="nm">${esc(r.name || r.path)}</span>
+    </button>`).join('');
+  rail.innerHTML = `<span class="lb">最近</span>` + items;
+  $$('.rchip[data-path]', rail).forEach(t => t.onclick = () => selectFile(t.dataset.path));
+}
+
+/* ============================ 选择 / 分析 ============================ */
+/* 文件对话框用 Tauri 的 dialog 插件（返回真实磁盘路径，不是 File 对象） */
+async function pickFile(){
+  if (S.picking) return;
+  S.picking = true;
+  try {
+    const picked = await T.dialog.open({
+      multiple: false,
+      directory: false,
+      defaultPath: S.ass || undefined,
+      filters: [{ name: '字幕', extensions: ['ass', 'ssa'] }],
+    });
+    if (picked) selectFile(typeof picked === 'string' ? picked : picked[0]);
+  } catch (e) {
+    toast('打开对话框失败：' + e, 'err');
+  } finally { S.picking = false; }
+}
+
+async function pickDir(start){
+  if (S.picking) return '';
+  S.picking = true;
+  try {
+    const picked = await T.dialog.open({ multiple: false, directory: true, defaultPath: start || undefined });
+    return picked ? (typeof picked === 'string' ? picked : picked[0]) : '';
+  } catch (e) {
+    toast('打开对话框失败：' + e, 'err');
+    return '';
+  } finally { S.picking = false; }
+}
+
+async function pickOut(){
+  const p = await pickDir($('#outdir').value);
+  if (!p) return;
+  $('#outdir').value = p;
+  saveSettings(); if (S.ass) analyze();
+}
+
+async function pickMod(){
+  const p = await pickDir($('#modRoot').value || S.modDir);
+  if (!p) return;
+  $('#modRoot').value = p;
+  saveSettings();
+}
+
+async function selectFile(path){
+  S.ass = path;
+  renderRail();
+  await analyze();
+}
+
+async function analyze(){
+  if (!S.ass) return;
+  const o = readForm();
+  setStage('plan', '分析时间轴…');
+  const r = await rpc('/api/analyze', {ass:o.ass, fps:+o.fps, width:o.width, height:o.height,
+    vfmt:o.vfmt, lang:o.lang, title:o.title, jobs:o.jobs, outdir:o.outdir});
+  if (!r.ok){ toast(r.error || '分析失败', 'err'); setStage('idle', '分析失败'); return; }
+  S.ass = r.ass || S.ass;                    // 用引擎返回的规范路径，避免两种斜杠写法并存
+  // 新选的文件要立刻出现在「最近」里（按规范化路径去重）
+  S.recent = [{path:S.ass, name:r.name}]
+    .concat(S.recent.filter(x => norm(x.path) !== norm(S.ass))).slice(0, 8);
+  renderRail();
+  renderInfo(r);
+  setStage('idle', `只需渲染 ${fmtN(r.work)} 帧（${r.ratio}%）`);
+  $('#btnRun').disabled = false; $('#btnRun2').disabled = false;
+}
+
+/* 刻度带：静态段＝灰块，动态段＝橙块，空档露出轨道底色 */
+function paintTimeline(el, readEl, r){
+  if (!el) return;
+  const bands = (r && r.bands) || [];
+  const list = (r && r.timeline) || [];
+  if (!bands.length && !list.length){
+    el.innerHTML = '<div class="strip-empty">选择字幕后在这里显示切段</div>';
+    if (readEl) readEl.textContent = '—';
+    return;
+  }
+  const total = r.duration || 1;
+  const fps = +r.fps || 24;
+  const items = bands.length ? bands.map((b,i)=>({i, a:b[0], b:b[1], dyn:!!b[2]})) : list;
+  el.innerHTML = '<div class="strip-grid"></div>' + items.map(s => {
+    const left = s.a / total * 100;
+    const w = Math.max((s.b - s.a) / total * 100, .06);
+    const frames = Math.max(1, Math.round((s.b - s.a) * fps));
+    const tip = `#${s.i} ${s.dyn?'动态':'静态'} ${tcOf(s.a,fps)} → ${tcOf(s.b,fps)} · ${fmtN(frames)} 帧`;
+    return `<i class="seg ${s.dyn?'d':'s'}" style="left:${left}%;width:${w}%" data-tip="${esc(tip)}"></i>`;
+  }).join('');
+
+  if (readEl){
+    readEl.innerHTML = `静态 <b>${r.sta}</b> · 动态 <b>${r.dyn}</b> · 全片 ${tcOf(total,fps)}`;
+    readEl.dataset.rest = readEl.innerHTML;
+    el.onmouseover = e => {
+      const g = e.target.closest('.seg');
+      if (g) readEl.textContent = g.dataset.tip;
+    };
+    el.onmouseleave = () => { readEl.innerHTML = readEl.dataset.rest; };
+  }
+}
+
+function setTicks(a, b, c, total, fps){
+  if (a) a.textContent = tcOf(0, fps);
+  if (b) b.textContent = total ? tcOf(total/2, fps) : '';
+  if (c) c.textContent = total ? tcOf(total, fps) : '';
+}
+
+function renderSegTable(r){
+  const el = $('#segTbl');
+  const list = (r && r.timeline) || [];
+  if (!list.length){ el.innerHTML = '<div class="empty">暂无数据</div>'; $('#segCount').textContent = ''; return; }
+  $('#segCount').textContent = (r && r.segs > list.length)
+    ? `前 ${list.length} / ${fmtN(r.segs)} 段`
+    : `${fmtN(list.length)} 段`;
+  const fps = +r.fps || 24;
+  const maxF = Math.max(...list.map(s => s.frames || 1), 1);
+  el.innerHTML = `<table class="tbl">
+    <colgroup><col style="width:64px"><col style="width:78px"><col style="width:118px"><col style="width:118px"><col style="width:78px"><col></colgroup>
+    <thead><tr><th>#</th><th>类型</th><th>起始 TC</th><th>结束 TC</th><th class="r">帧</th><th>段长</th></tr></thead>
+    <tbody>${list.map(s => `<tr class="${s.dyn?'dyn':''}">
+      <td class="c-num">${s.i}</td>
+      <td class="c-type">${s.dyn?'动态':'静态'}</td>
+      <td class="c-tc">${tcOf(s.a, fps)}</td>
+      <td class="c-tc">${tcOf(s.b, fps)}</td>
+      <td class="c-tc r">${fmtN(s.frames)}</td>
+      <td><span class="sbar ${s.dyn?'d':''}"><i style="width:${Math.max(1,(s.frames||1)/maxF*100).toFixed(1)}%"></i></span></td>
+    </tr>`).join('')}</tbody></table>`;
+}
+
+function renderInfo(r){
+  S.info = r;
+  const t = $('#fileText');
+  t.textContent = r.name || '未选择文件';
+  t.classList.toggle('ph', !r.name);
+  $('#fileMeta').textContent =
+    `${fmtN(r.events)} 事件 · ${r.duration_hms} · ${fmtN(r.frames)} 帧 · ${r.w}×${r.h} · 静态 ${r.sta} / 动态 ${r.dyn} 段`;
+
+  $('#bigPct').textContent = r.ratio;
+  if ($('#bigPct2')) $('#bigPct2').textContent = r.ratio;
+
+  $('#stEvents').textContent = fmtN(r.events);
+  $('#stSegs').textContent = fmtN(r.segs);
+  $('#stWork').textContent = fmtN(r.work);
+  $('#stWorkSub').textContent = `占全片 ${r.ratio}%`;
+  const sp = r.est_fast > 0 ? (r.est_orig / r.est_fast) : 1;
+  $('#stSpeed').textContent = (sp>=1.05?sp.toFixed(1):'1.0') + '×';
+
+  paintTimeline($('#tl'), $('#tlRead'), r);
+  paintTimeline($('#tlBig'), $('#tlRead2'), r);
+  setTicks($('#tl0'), $('#tl1'), $('#tl2'), r.duration, r.fps);
+  setTicks($('#tl0b'), $('#tl1b'), $('#tl2b'), r.duration, r.fps);
+
+  const title = `${fmtN(r.segs)} 段 · 需渲染 ${fmtN(r.work)} 帧`;
+  $('#tlTitle').textContent = title;
+  if ($('#tlTitle2')) $('#tlTitle2').textContent = title;
+
+  renderSegTable(r);
+  $('#advHint').textContent = `${r.w}×${r.h} · ${r.fps}fps`;
+
+  // 分析会在每次改设置后重跑，notes / warnings 只跟字幕文件有关：
+  // 同一个文件重算多少遍都只报一次，换文件（或提示内容变了）才再报。
+  const notes = r.notes || [], warns = r.warnings || [];
+  const key = S.ass + '\u0001' + notes.join('\u0002') + '\u0001' + warns.join('\u0002');
+  if (key !== S.noteKey){
+    S.noteKey = key;
+    if (notes.length) pushLog(notes.map(n => ({ kind: 'dim', line: '分析 · ' + n })));
+    if (warns.length) toast(warns[0], 'err');
+  }
+}
+
+/* ============================ 运行 ============================ */
+const STAGE_TXT = {idle:['就绪','等待开始'], plan:['分析中','解析 ASS 时间轴'],
+  render:['渲染中','逐段调用 avs2bdnxml'], write:['写出中','重写 XML / 重映射 PTS'],
+  done:['完成','输出已生成'], error:['出错','见日志'], cancel:['已取消','任务终止']};
+
+function setStage(stage, sub){
+  const [n, d] = STAGE_TXT[stage] || [stage, ''];
+  $('#stageName').textContent = n;
+  $('#stageSub').textContent = sub ?? d;
+  const dot = $('#sbDot');
+  dot.className = 'sb-dot ' + (stage==='error' ? 'bad' : stage==='done' ? 'ok'
+    : stage==='idle' ? '' : 'run');
+  $('#sbText').textContent = S.ass
+    ? `${n} · ${$('#fileText').textContent}`
+    : (stage==='idle' ? '未加载字幕' : n);
+}
+
+function setPct(v){
+  const p = Math.max(0, Math.min(100, v));
+  $('#pctNum').textContent = Math.round(p);
+  $('#bar').style.width = p + '%';
+  $('#sbProg').style.width = p + '%';
+  $('#sbPct').textContent = (S.running || p > 0) ? Math.round(p) + '%' : '';
+}
+
+function pushLog(lines){
+  if (!lines || !lines.length) return;
+  const el = $('#log');
+  if (S.logLines === 0) el.innerHTML = '';
+  const frag = document.createDocumentFragment();
+  for (const l of lines){
+    const d = document.createElement('div');
+    d.className = 'l-' + (l.kind || 'dim');
+    d.textContent = l.line;
+    frag.appendChild(d);
+  }
+  el.appendChild(frag);
+  S.logLines += lines.length;
+  $('#logCount').textContent = S.logLines + ' 行';
+  const near = el.scrollHeight - el.scrollTop - el.clientHeight < 90;
+  if (near) el.scrollTop = el.scrollHeight;
+}
+
+async function start(){
+  if (S.running || !S.ass) return;
+  const o = readForm();
+  const r = await rpc('/api/start', {opts:o});
+  if (!r.ok){ toast(r.error || '无法启动', 'err'); return; }
+  S.running = true; S.logLines = 0; S.seq = 0;
+  $('#log').innerHTML = '';
+  $('#logCount').textContent = '0 行';
+  $('#btnRun').disabled = true; $('#btnRun2').disabled = true;
+  $('#btnCancel').disabled = false; $('#btnOpenOut').disabled = true;
+  $('#logDot').classList.add('live');
+  setStage('plan', '启动…'); setPct(1);
+  showPane('log');
+  poll();
+}
+
+async function cancel(){
+  const r = await rpc('/api/cancel');
+  if (!r.ok) toast(r.error || '', 'err');
+}
+
+async function poll(){
+  if (!S.running) return;
+  const st = await rpc('/api/status?since=' + S.seq);
+  if (st.lines?.length){ pushLog(st.lines); S.seq = st.log_seq; }
+  setPct(st.pct || 0);
+  if (st.stage) setStage(st.stage, st.stage==='render' && st.total ? `已完成 ${st.done}/${st.total} 段` : undefined);
+  if (st.stage === 'render' && st.total){
+    $('#stageSub').textContent = `已完成 ${st.done}/${st.total} 段 · ${fmtN(st.pngs)} 张 PNG`;
+  }
+  if (st.plan){
+    $('#stEvents').textContent = fmtN(st.plan.events);
+    $('#stSegs').textContent = fmtN(st.plan.segs);
+  }
+  if (!st.running){
+    S.running = false;
+    $('#btnRun').disabled = false; $('#btnRun2').disabled = false;
+    $('#btnCancel').disabled = true;
+    $('#logDot').classList.remove('live');
+    if (st.stage === 'done' && st.result){
+      const rr = st.result;
+      $('#btnOpenOut').disabled = false;
+      toast(`完成：${fmtN(rr.pngs)} 张 PNG，${rr.secs}s，${rr.speed}×`, 'ok');
+      await refreshHistory();
+    } else if (st.stage === 'error'){
+      toast(st.error || '转换失败', 'err');
+    } else if (st.stage === 'cancel'){
+      toast('已取消');
+    }
+    return;
+  }
+  setTimeout(poll, 380);
+}
+
+/* ============================ 历史 ============================ */
+async function refreshHistory(){
+  const st = await rpc('/api/state');
+  S.history = st.history || [];
+  S.recent = st.recent || [];
+  renderRail();
+  renderHistory();
+}
+
+function renderHistory(){
+  const row = $('#histRow');
+  const n = S.history.length;
+  $('#tabHistCount').textContent = n ? String(n) : '';
+  $('#histCount').textContent = n ? `${n} 次` : '';
+  $('#btnClearHist').style.display = n ? '' : 'none';
+
+  if (!n){
+    row.innerHTML = `<div class="empty">还没有转换记录</div>`;
+    return;
+  }
+  row.innerHTML = `<table class="htbl">
+    <colgroup><col style="width:112px"><col><col style="width:76px"><col style="width:82px">
+      <col style="width:78px"><col style="width:86px"><col style="width:44px"></colgroup>
+    <thead><tr>
+      <th>时间</th><th>字幕</th><th class="r">PNG</th>
+      <th class="r">SUP</th><th class="r">耗时</th>
+      <th class="r">较原版</th><th></th>
+    </tr></thead>
+    <tbody>${S.history.map(h => {
+      const name = h.name || '未命名';
+      const d = new Date((h.ts || 0) * 1000);
+      const date = `${d.getMonth()+1}/${d.getDate()} ${pad(d.getHours())}:${pad(d.getMinutes())}`;
+      return `<tr data-out="${esc(h.outdir||'')}" data-ts="${h.ts||0}" title="${esc(h.outdir||name)}">
+        <td class="c-time">${date}</td>
+        <td class="c-name">${esc(name)}</td>
+        <td class="c-num r">${fmtN(h.pngs||0)}</td>
+        <td class="c-num r dim">${mb(h.sup_size||0)}</td>
+        <td class="c-num r">${(+(h.secs||0)).toFixed(1)}s</td>
+        <td class="c-spd r">${h.speed ? h.speed+'×' : '—'}</td>
+        <td class="c-act"><button class="rowdel" title="删除记录"><svg class="ic"><use href="#i-x"/></svg></button></td>
+      </tr>`;
+    }).join('')}</tbody></table>`;
+
+  $$('tr[data-ts]', row).forEach(p => {
+    p.onclick = e => {
+      if (e.target.closest('.rowdel')) return;
+      const out = p.dataset.out;
+      if (out) rpc('/api/open', {path:out, mode:'dir'});
+    };
+    p.querySelector('.rowdel').onclick = async e => {
+      e.stopPropagation();
+      await rpc('/api/forget', {kind:'history', ts:+p.dataset.ts});
+      refreshHistory();
+    };
+  });
+}
+
+$('#btnClearHist').onclick = async () => {
+  if (!confirm('清空全部转换记录？已生成的输出文件不受影响。')) return;
+  await rpc('/api/forget', {kind:'history-all'});
+  refreshHistory();
+};
+
+/* ============================ 交互绑定 ============================ */
+$('#btnRun').onclick = start;
+$('#btnRun2').onclick = start;
+$('#btnCancel').onclick = cancel;
+$('#btnPick').onclick = pickFile;
+$('#btnPickOut').onclick = pickOut;
+$('#btnPickMod').onclick = pickMod;
+$('#btnReset').onclick = () => applyDefaults();
+$('#presetBtn').onclick = () => showPane('convert');
+
+// 窗口按钮：这些是 Tauri 的写操作，必须在 capabilities 里显式授权，
+// 否则 Promise 直接拒绝——以前没写 catch，所以点了完全没反应也看不到原因。
+const winAct = (fn) => () => Promise.resolve(fn(appWindow))
+  .catch(e => toast('窗口操作失败：' + e, 'err'));
+$('#dotClose').onclick = winAct(w => w.close());
+$('#dotMin').onclick = winAct(w => w.minimize());
+$('#dotMax').onclick = winAct(w => w.toggleMaximize());
+
+$('#btnOpenOut').onclick = () => {
+  const out = (S.history[0] && S.history[0].outdir) || '';
+  if (out) rpc('/api/open', {path:out, mode:'dir'});
+  else toast('还没有输出目录');
+};
+
+addEventListener('keydown', e => {
+  if ((e.ctrlKey || e.metaKey) && e.key === 'Enter'){ e.preventDefault(); start(); }
+  if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'o'){ e.preventDefault(); pickFile(); }
+});
+
+function applyDefaults(){
+  const d = {fps:'23.976', vfmt:'1080p', lang:'zho', title:'Undefined', jobs:8, outdir:'', modRoot:'', w:'', h:''};
+  Object.entries(d).forEach(([k, v]) => { const el = $('#'+k); if (el) el.value = v; });
+  TOGGLES.forEach(k => $(`.sw[data-k="${k}"]`).classList.toggle('on',
+    ['palette','autocrop','bufsplit'].includes(k)));
+  syncPreset(); saveSettings();
+  if (S.ass) analyze();
+  toast('已恢复默认');
+}
+
+/* ============================ 拖放 .ass ============================ */
+/* webview 自己吞掉了 HTML5 拖放事件，拿不到真实路径；Tauri 会把路径直接给过来 */
+(function initDrop(){
+  T.webview.getCurrentWebview().onDragDropEvent((ev) => {
+    const p = ev.payload || {};
+    if (p.type === 'enter' || p.type === 'over'){ document.body.classList.add('dragging'); return; }
+    if (p.type === 'leave'){ document.body.classList.remove('dragging'); return; }
+    if (p.type !== 'drop') return;
+    document.body.classList.remove('dragging');
+    const list = p.paths || [];
+    if (!list.length) return;
+    const file = list[0];
+    if (!/\.(ass|ssa)$/i.test(file)){ toast('只支持 .ass / .ssa 字幕', 'err'); return; }
+    selectFile(file);
+  });
+})();
+
+/* ============================ 禁用右键菜单 ============================ */
+/* 后端已经把 AreDefaultContextMenusEnabled 关掉了，这里再拦一层：
+   防止页面脚本 / 输入框在 contextmenu 上做默认处理，也让「拖选文字后右键」彻底安静 */
+addEventListener('contextmenu', (e) => { e.preventDefault(); e.stopPropagation(); }, true);
+
+/* ============================ 启动 ============================ */
+async function boot(){
+  const st = await rpc('/api/boot');
+  applyTheme((st.settings && st.settings.theme) || 'auto', false);
+  $('#ftUrl').textContent = `v${st.version || '1.0.0'} · Tauri ${st.tauri || '2'}`;
+  S.env = st.env || []; S.modDir = st.mod_dir || '';
+  S.recent = st.recent || []; S.history = st.history || [];
+  applySettings(st.settings);
+  renderEnv(); renderRail(); renderHistory();
+  setStage('idle'); setPct(0);
+
+  // 启动时不自动选中上次的字幕：文件行留空，等用户从「最近」点一条或拖一个进来。
+  // （以前这里会把 recent[0] 直接 selectFile，导致每次打开都带着上一条字幕）
+
+  // 冒烟测试：SUPFAST_AUTOSTART=1 时加载完直接开跑；SUPFAST_PANE 指定标签页
+  if (st.pane){ showPane(st.pane); }
+  if (st.openAdv){ const a = document.getElementById('adv'); if (a) a.open = true; }
+  if (st.autostart){
+    // 启动不再自动选中，冒烟测试要自己补上最近一条
+    if (!S.ass && S.recent.length) await selectFile(S.recent[0].path);
+    if (S.ass) setTimeout(start, 800);
+  }
+
+  // 恢复运行中的任务（例如窗口重开）
+  const cur = await rpc('/api/status?since=0');
+  if (cur.running){
+    S.running = true; S.logLines = 0; S.seq = 0;
+    $('#btnRun').disabled = true; $('#btnRun2').disabled = true;
+    $('#btnCancel').disabled = false; $('#logDot').classList.add('live');
+    showPane('log');
+    poll();
+  } else {
+    if (cur.lines?.length){ pushLog(cur.lines); S.seq = cur.log_seq; }
+    if (cur.stage && cur.stage !== 'idle'){
+      setStage(cur.stage, cur.stage==='done' ? '上次任务已完成' : undefined);
+      setPct(cur.pct || 0);
+      if (cur.stage === 'done' && cur.result) $('#btnOpenOut').disabled = false;
+    }
+  }
+}
+boot();
+</script>
+</body>
+</html>
