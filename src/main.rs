@@ -605,10 +605,88 @@ fn cli_engine(args: &[String]) -> i32 {
 // 入口
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// 单实例
+// ---------------------------------------------------------------------------
+//
+// WebView2 的用户数据目录是独占的：双击两次会起两个进程，第二个在
+// create_webview 时拿到 HRESULT 0x800700AA（请求的资源在使用中），
+// setup 返回 Err → main 里的 expect panic → 没有控制台，用户看到「双击没反应」。
+// 用命名互斥体拦住：进程退出或崩溃时系统自动释放，不会留下僵尸锁。
+#[cfg(windows)]
+mod single {
+    use std::ffi::c_void;
+    use std::sync::atomic::{AtomicIsize, Ordering};
+
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn CreateMutexW(attrs: *const c_void, owner: i32, name: *const u16) -> isize;
+        fn GetLastError() -> u32;
+    }
+    #[link(name = "user32")]
+    extern "system" {
+        fn EnumWindows(cb: extern "system" fn(isize, isize) -> i32, lparam: isize) -> i32;
+        fn GetWindowTextW(h: isize, buf: *mut u16, n: i32) -> i32;
+        fn IsWindowVisible(h: isize) -> i32;
+        fn ShowWindow(h: isize, cmd: i32) -> i32;
+        fn SetForegroundWindow(h: isize) -> i32;
+    }
+
+    const ERROR_ALREADY_EXISTS: u32 = 183;
+    const SW_RESTORE: i32 = 9;
+    static FOUND: AtomicIsize = AtomicIsize::new(0);
+
+    /// true = 本进程拿到了独占锁，可以继续启动
+    pub fn acquire() -> bool {
+        let name: Vec<u16> = "supfast_single_instance_v1\0".encode_utf16().collect();
+        unsafe {
+            // 句柄故意不关：关掉就等于释放锁
+            let h = CreateMutexW(std::ptr::null(), 0, name.as_ptr());
+            if h == 0 {
+                return true; // 建不出锁就别拦着用户
+            }
+            GetLastError() != ERROR_ALREADY_EXISTS
+        }
+    }
+
+    extern "system" fn find_main(h: isize, _l: isize) -> i32 {
+        unsafe {
+            if IsWindowVisible(h) == 0 {
+                return 1;
+            }
+            let mut buf = [0u16; 256];
+            let n = GetWindowTextW(h, buf.as_mut_ptr(), buf.len() as i32);
+            if n > 0 && String::from_utf16_lossy(&buf[..n as usize]) == "supfast" {
+                FOUND.store(h, Ordering::SeqCst);
+                return 0; // 找到就停
+            }
+        }
+        1
+    }
+
+    /// 把已有实例的窗口叫到前台，让「再点一次」看起来有反应
+    pub fn activate_existing() {
+        unsafe {
+            EnumWindows(find_main, 0);
+            let h = FOUND.load(Ordering::SeqCst);
+            if h != 0 {
+                ShowWindow(h, SW_RESTORE);
+                SetForegroundWindow(h);
+            }
+        }
+    }
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     if args.first().map(|a| a == "--engine").unwrap_or(false) {
         std::process::exit(cli_engine(&args[1..]));
+    }
+
+    #[cfg(windows)]
+    if !single::acquire() {
+        single::activate_existing();
+        return;
     }
 
     tauri::Builder::default()
