@@ -9,7 +9,7 @@ if not exist "dist\supfast.exe" (
   exit /b 1
 )
 
-set VER=1.0.0
+set VER=1.0.1
 set NAME=supfast-%VER%-win64
 set STAGE=%TEMP%\supfast-rel-%RANDOM%%RANDOM%
 
