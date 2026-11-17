@@ -622,16 +622,27 @@ fn strip_verbatim(p: &str) -> String {
     p.to_string()
 }
 
-/// 输出目录。留空时与字幕同目录：产物直接落在 .ass 旁边，
-/// 不再多套一层 `<字幕名>\`（那层目录对按片管理的用户只是多一次点击）。
-fn resolve_outdir(ass_path: &Path, outdir: Option<&Path>) -> PathBuf {
-    if let Some(p) = outdir {
-        return p.to_path_buf();
-    }
-    match ass_path.parent() {
-        // 相对路径 "test.ass" 的 parent 是空串，join 出来的目录不存在，落回当前目录
+/// 解析产物目录。一律是 `<父目录>\<字幕名>\`：
+/// 留空时父目录取字幕所在目录，填了（或浏览选了）就用那个目录当父目录。
+/// 所以「留空」和「选字幕所在目录」结果完全一致，不会因为选没选而产生两套布局。
+/// 万一选中的目录本身已经叫字幕名（重复点进去过），就不再套一层。
+fn resolve_outdir(ass_path: &Path, outdir: Option<&Path>, base: &str) -> PathBuf {
+    let parent = match outdir {
         Some(p) if !p.as_os_str().is_empty() => p.to_path_buf(),
-        _ => PathBuf::from("."),
+        _ => match ass_path.parent() {
+            // 相对路径 "test.ass" 的 parent 是空串，落回当前目录
+            Some(p) if !p.as_os_str().is_empty() => p.to_path_buf(),
+            _ => PathBuf::from("."),
+        },
+    };
+    let already = parent
+        .file_name()
+        .and_then(|s| s.to_str())
+        .is_some_and(|n| n.eq_ignore_ascii_case(base));
+    if already {
+        parent
+    } else {
+        parent.join(base)
     }
 }
 
@@ -926,8 +937,8 @@ pub fn analyze(opts: &Value) -> Result<Value, String> {
         .file_stem()
         .map(|s| s.to_string_lossy().to_string())
         .unwrap_or_else(|| "subtitle".into());
-    // 界面要显示「产物会落在哪」，留空时由后端算出实际目录，避免前端另写一套路径规则
-    let outdir = resolve_outdir(Path::new(&ass_path), o.outdir.as_deref());
+    // 界面要显示「产物会落在哪」，统一由后端算，避免前端另写一套路径规则
+    let outdir = resolve_outdir(Path::new(&ass_path), o.outdir.as_deref(), &name);
 
     Ok(json!({
         "ok": true,
@@ -1187,7 +1198,7 @@ pub fn convert(opts: &Value, emit: Emit, cancel: Arc<AtomicBool>) -> Result<Valu
         .file_stem()
         .map(|s| s.to_string_lossy().to_string())
         .unwrap_or_else(|| "out".into());
-    let outdir = resolve_outdir(&ass_path, o.outdir.as_deref());
+    let outdir = resolve_outdir(&ass_path, o.outdir.as_deref(), &base);
     fs::create_dir_all(&outdir).map_err(|e| format!("建输出目录失败: {}", e))?;
 
     // 临时目录必须独占创建：名字若可预测，别人可以预先建好同名 junction / 符号链接，

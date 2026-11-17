@@ -687,10 +687,10 @@ body.dragging::after{
     <div class="fld" style="margin-top:16px">
       <label>输出目录</label>
       <div class="row">
-        <input class="sel" id="outdir" placeholder="留空 = 与字幕同目录">
+        <input class="sel" id="outdir" placeholder="留空 = <字幕目录>/<字幕名>/">
         <button class="icon-sq" id="btnPickOut" title="浏览"><svg class="ic"><use href="#i-folder"/></svg></button>
       </div>
-      <p class="desc" id="outHint">生成 <code>&lt;字幕名&gt;.xml</code>（BDN）与 <code>&lt;字幕名&gt;.sup</code>（PGS）</p>
+      <p class="desc" id="outHint">产物放在 <code>&lt;目录&gt;\&lt;字幕名&gt;\</code> 里：<code>&lt;字幕名&gt;.xml</code>（BDN）与 <code>&lt;字幕名&gt;.sup</code>（PGS）</p>
     </div>
 
     <details class="adv" id="adv">
@@ -1053,7 +1053,7 @@ async function pickDir(start){
 }
 
 async function pickOut(){
-  // 没填过就从字幕所在目录开始，和「留空 = 与字幕同目录」的默认落点一致
+  // 没填过就从字幕所在目录开始：那里就是要选的「父目录」默认值
   const p = await pickDir($('#outdir').value || dirOf(S.ass));
   if (!p) return;
   $('#outdir').value = p;
@@ -1150,8 +1150,8 @@ function renderSegTable(r){
     </tr>`).join('')}</tbody></table>`;
 }
 
-/* 输出目录提示：留空时后端按「与字幕同目录」解析，这里把实际落点写出来，
-   免得用户以为还要自己填一遍目录 */
+/* 输出目录提示：产物一律落在 <目录>\<字幕名>\ 里，这里把实际的完整落点写出来，
+   免得用户以为还要自己再套一层字幕名子目录 */
 function renderOutHint(r){
   const el = $('#outHint');
   if (!el) return;
@@ -1159,11 +1159,11 @@ function renderOutHint(r){
   const dir = (r && r.outdir) || manual;
   const nm = (r && r.name) || '字幕名';
   if (!dir || !(r || S.ass)){
-    el.innerHTML = '留空时与字幕同目录：生成 <code>&lt;字幕名&gt;.xml</code>（BDN）与 <code>&lt;字幕名&gt;.sup</code>（PGS）';
+    el.innerHTML = '产物放在 <code>&lt;目录&gt;\\&lt;字幕名&gt;\\</code> 里：<code>&lt;字幕名&gt;.xml</code>（BDN）与 <code>&lt;字幕名&gt;.sup</code>（PGS）';
     el.title = '';
     return;
   }
-  el.innerHTML = `输出到 <span class="path">${esc(dir)}</span> · 生成 <code>${esc(nm)}.xml</code> / <code>${esc(nm)}.sup</code>`;
+  el.innerHTML = `输出到 <span class="path">${esc(dir)}\\</span> · <code>${esc(nm)}.xml</code> / <code>${esc(nm)}.sup</code>`;
   el.title = `${dir}\\${nm}.xml\n${dir}\\${nm}.sup`;
 }
 
