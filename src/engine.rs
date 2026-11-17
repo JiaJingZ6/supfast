@@ -622,6 +622,19 @@ fn strip_verbatim(p: &str) -> String {
     p.to_string()
 }
 
+/// 输出目录。留空时与字幕同目录：产物直接落在 .ass 旁边，
+/// 不再多套一层 `<字幕名>\`（那层目录对按片管理的用户只是多一次点击）。
+fn resolve_outdir(ass_path: &Path, outdir: Option<&Path>) -> PathBuf {
+    if let Some(p) = outdir {
+        return p.to_path_buf();
+    }
+    match ass_path.parent() {
+        // 相对路径 "test.ass" 的 parent 是空串，join 出来的目录不存在，落回当前目录
+        Some(p) if !p.as_os_str().is_empty() => p.to_path_buf(),
+        _ => PathBuf::from("."),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // 工具定位
 // ---------------------------------------------------------------------------
@@ -913,11 +926,14 @@ pub fn analyze(opts: &Value) -> Result<Value, String> {
         .file_stem()
         .map(|s| s.to_string_lossy().to_string())
         .unwrap_or_else(|| "subtitle".into());
+    // 界面要显示「产物会落在哪」，留空时由后端算出实际目录，避免前端另写一套路径规则
+    let outdir = resolve_outdir(Path::new(&ass_path), o.outdir.as_deref());
 
     Ok(json!({
         "ok": true,
         "ass": ass_path,
         "name": name,
+        "outdir": outdir.to_string_lossy(),
         "events": ass.events.len(),
         "frames": frames,
         "duration": (duration * 1000.0).round() / 1000.0,
@@ -1171,10 +1187,7 @@ pub fn convert(opts: &Value, emit: Emit, cancel: Arc<AtomicBool>) -> Result<Valu
         .file_stem()
         .map(|s| s.to_string_lossy().to_string())
         .unwrap_or_else(|| "out".into());
-    let outdir = o.outdir.clone().unwrap_or_else(|| {
-        let parent = ass_path.parent().unwrap_or(Path::new("."));
-        parent.join(&base)
-    });
+    let outdir = resolve_outdir(&ass_path, o.outdir.as_deref());
     fs::create_dir_all(&outdir).map_err(|e| format!("建输出目录失败: {}", e))?;
 
     // 临时目录必须独占创建：名字若可预测，别人可以预先建好同名 junction / 符号链接，

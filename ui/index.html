@@ -253,6 +253,9 @@ a{color:inherit;text-decoration:none}
 .fld{display:flex;flex-direction:column;gap:6px;min-width:0}
 .fld>label{font-size:12px;font-weight:500;color:var(--ink-2);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .desc{margin:0;font-size:11px;color:var(--ink-4);line-height:1.55}
+/* 输出目录提示：路径可能很长，压缩成一行省略，完整路径放 title */
+#outHint{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+#outHint .path{font-family:var(--mono);color:var(--ink-3)}
 .sel{
   height:34px;width:100%;padding:0 10px;border-radius:7px;min-width:0;
   background:var(--panel);border:1px solid var(--line);color:var(--ink);
@@ -684,10 +687,10 @@ body.dragging::after{
     <div class="fld" style="margin-top:16px">
       <label>输出目录</label>
       <div class="row">
-        <input class="sel" id="outdir" placeholder="留空 = <字幕目录>/<字幕名>/">
+        <input class="sel" id="outdir" placeholder="留空 = 与字幕同目录">
         <button class="icon-sq" id="btnPickOut" title="浏览"><svg class="ic"><use href="#i-folder"/></svg></button>
       </div>
-      <p class="desc">生成 <code>&lt;字幕名&gt;.xml</code>（BDN）与 <code>&lt;字幕名&gt;.sup</code>（PGS）</p>
+      <p class="desc" id="outHint">生成 <code>&lt;字幕名&gt;.xml</code>（BDN）与 <code>&lt;字幕名&gt;.sup</code>（PGS）</p>
     </div>
 
     <details class="adv" id="adv">
@@ -848,6 +851,14 @@ const fmtN = n => (n??0).toLocaleString('en-US');
 const pad = n => String(n).padStart(2,'0');
 // 同一个文件可能以 H:/a/b.ass 或 H://a//b.ass 两种写法出现，比较前统一
 const norm = p => String(p||'').replace(/[\\/]+/g,'/').replace(/\/+$/,'').toLowerCase();
+// 取目录部分（只用于展示「产物会落在哪」，真正的解析由后端算）
+const dirOf = p => {
+  const s = String(p||'').replace(/[\\/]+$/,'');
+  const i = Math.max(s.lastIndexOf('\\'), s.lastIndexOf('/'));
+  if (i < 0) return '';
+  const d = s.slice(0, i);
+  return /^[A-Za-z]:$/.test(d) ? d + '\\' : d;   // H:\a.ass → H:\ 而不是 H:
+};
 
 /* 全站唯一的时间码格式：HH:MM:SS:FF —— 最后一格是帧，不是百分秒 */
 const tcOf = (sec, fps) => {
@@ -1042,7 +1053,8 @@ async function pickDir(start){
 }
 
 async function pickOut(){
-  const p = await pickDir($('#outdir').value);
+  // 没填过就从字幕所在目录开始，和「留空 = 与字幕同目录」的默认落点一致
+  const p = await pickDir($('#outdir').value || dirOf(S.ass));
   if (!p) return;
   $('#outdir').value = p;
   saveSettings(); if (S.ass) analyze();
@@ -1138,6 +1150,23 @@ function renderSegTable(r){
     </tr>`).join('')}</tbody></table>`;
 }
 
+/* 输出目录提示：留空时后端按「与字幕同目录」解析，这里把实际落点写出来，
+   免得用户以为还要自己填一遍目录 */
+function renderOutHint(r){
+  const el = $('#outHint');
+  if (!el) return;
+  const manual = $('#outdir').value.trim();
+  const dir = (r && r.outdir) || manual;
+  const nm = (r && r.name) || '字幕名';
+  if (!dir || !(r || S.ass)){
+    el.innerHTML = '留空时与字幕同目录：生成 <code>&lt;字幕名&gt;.xml</code>（BDN）与 <code>&lt;字幕名&gt;.sup</code>（PGS）';
+    el.title = '';
+    return;
+  }
+  el.innerHTML = `输出到 <span class="path">${esc(dir)}</span> · 生成 <code>${esc(nm)}.xml</code> / <code>${esc(nm)}.sup</code>`;
+  el.title = `${dir}\\${nm}.xml\n${dir}\\${nm}.sup`;
+}
+
 function renderInfo(r){
   S.info = r;
   const t = $('#fileText');
@@ -1167,6 +1196,7 @@ function renderInfo(r){
 
   renderSegTable(r);
   $('#advHint').textContent = `${r.w}×${r.h} · ${r.fps}fps`;
+  renderOutHint(r);
 
   // 分析会在每次改设置后重跑，notes / warnings 只跟字幕文件有关：
   // 同一个文件重算多少遍都只报一次，换文件（或提示内容变了）才再报。
