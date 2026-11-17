@@ -1,0 +1,62 @@
+name: release
+
+# 打 tag（v*）时自动把 packaging/artifacts/ 里的 zip 发成 GitHub Release。
+# 也可以在 Actions 页面手动触发，填一个已存在的 tag。
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: '要发布的 tag（例如 v1.0.0，需已存在）'
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 检查待发布的包
+        run: |
+          set -e
+          ls -lh packaging/artifacts/
+          count=$(ls -1 packaging/artifacts/*.zip 2>/dev/null | wc -l)
+          if [ "$count" -ne 1 ]; then
+            echo "packaging/artifacts/ 里应当正好有一个 zip，实际 $count 个"
+            exit 1
+          fi
+
+      - name: 创建 release 并上传 zip
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -e
+          TAG="$GITHUB_REF_NAME"
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            TAG="${{ inputs.tag }}"
+          fi
+          VER="${TAG#v}"
+          NOTES="packaging/release-notes-${VER}.md"
+
+          echo "tag=$TAG version=$VER"
+
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "release $TAG 已存在，只补传附件"
+          else
+            if [ -f "$NOTES" ]; then
+              gh release create "$TAG" --title "supfast $VER" --notes-file "$NOTES"
+            else
+              gh release create "$TAG" --title "supfast $VER" --generate-notes
+            fi
+          fi
+
+          gh release upload "$TAG" packaging/artifacts/*.zip --clobber
+
+      - name: 结果
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh release list --limit 5
