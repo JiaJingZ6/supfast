@@ -57,7 +57,7 @@ const DEFAULT_SETTINGS: &str = r#"{
   "mod_root":"","fps":"23.976","vfmt":"1080p","lang":"zho","title":"Undefined",
   "theme":"auto","jobs":8,"outdir":"",
   "palette":1,"autocrop":1,"bufsplit":1,"stricter":0,"even_y":0,"no_sup":0,"dry_run":0,
-  "super_encode":0,"native_pgs":0
+  "super_encode":0,"native_pgs":0,"palette_fade":1
 }"#;
 
 impl Shared {
@@ -675,6 +675,7 @@ fn cli_engine(args: &[String]) -> i32 {
     let mut json_out = String::new();
     let mut super_encode = false;
     let mut native_pgs = false;
+    let mut palette_fade = true;
     let mut super_cmd = String::new();
     let mut i = 0;
     while i < args.len() {
@@ -721,6 +722,7 @@ fn cli_engine(args: &[String]) -> i32 {
             }
             "--super" => super_encode = true,
             "--native-pgs" => native_pgs = true,
+            "--no-palette-fade" => palette_fade = false,
             "--super-cmd" => {
                 i += 1;
                 super_cmd = args.get(i).cloned().unwrap_or_default();
@@ -747,7 +749,7 @@ fn cli_engine(args: &[String]) -> i32 {
     }
     if mode == "pgs" {
         if xml.is_empty() {
-            eprintln!("用法: supfast --engine pgs --xml <file.xml> [--out <file.sup>] [--vw 1920] [--vh 1080] [--json <out.json>]");
+            eprintln!("用法: supfast --engine pgs --xml <file.xml> [--out <file.sup>] [--vw 1920] [--vh 1080] [--no-palette-fade] [--json <out.json>]");
             return 2;
         }
         let xp = Path::new(&xml);
@@ -756,7 +758,7 @@ fn cli_engine(args: &[String]) -> i32 {
         } else {
             PathBuf::from(&out)
         };
-        return match pgs::encode(xp, &outp, vw, vh) {
+        return match pgs::encode(xp, &outp, vw, vh, palette_fade) {
             Ok(mut v) => {
                 v["verify"] = verify::verify_sup_file(&outp).unwrap_or_else(|e| json!({
                     "ok": false, "compliant": false,
@@ -773,14 +775,15 @@ fn cli_engine(args: &[String]) -> i32 {
         };
     }
     if ass.is_empty() {
-        eprintln!("用法: supfast --engine analyze|convert --ass <file.ass> [--out <dir>] [--fps 23.976] [--jobs 8] [--super] [--super-cmd <path>] [--native-pgs]");
+        eprintln!("用法: supfast --engine analyze|convert --ass <file.ass> [--out <dir>] [--fps 23.976] [--jobs 8] [--super] [--super-cmd <path>] [--native-pgs] [--no-palette-fade]");
         eprintln!("     supfast --engine verify --sup <file.sup> [--json <out.json>]");
-        eprintln!("     supfast --engine pgs --xml <file.xml> [--out <file.sup>] [--json <out.json>]");
+        eprintln!("     supfast --engine pgs --xml <file.xml> [--out <file.sup>] [--no-palette-fade] [--json <out.json>]");
         return 2;
     }
     let opts = json!({ "ass": ass, "fps": fps, "jobs": jobs, "outdir": out,
         "vfmt": "1080p", "lang": "chi", "title": "Undefined",
-        "super_encode": super_encode, "super_cmd": super_cmd, "native_pgs": native_pgs });
+        "super_encode": super_encode, "super_cmd": super_cmd,
+        "native_pgs": native_pgs, "palette_fade": palette_fade });
     match mode {
         "analyze" => match engine::analyze(&opts) {
             Ok(v) => {

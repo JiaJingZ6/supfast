@@ -12,6 +12,7 @@
 
 use flate2::read::ZlibDecoder;
 use serde_json::{json, Value};
+use std::collections::HashMap;
 use std::fs;
 use std::io::Read;
 use std::path::Path;
@@ -27,6 +28,10 @@ const OBJ_BUDGET: u64 = 3 * 1024 * 1024;
 const MAX_OBJ_IDS: usize = 60;
 /// 超过 2 秒的字幕空档就另起一个 epoch
 const MAX_GAP_TICKS: u32 = 180_000;
+/// 反量化重映射的序列缓冲上限：避免异常输入撑爆内存（约 32 MiB）
+const FADE_MAX_SEQ_BYTES: usize = 32 * 1024 * 1024;
+/// 一条调色板动画链最多纳入的帧数
+const FADE_MAX_FRAMES: usize = 512;
 
 const PCS: u8 = 0x16;
 const WDS: u8 = 0x17;
@@ -572,14 +577,210 @@ fn object_key(plte: &[[u8; 3]], trns: &[u8], rle: &[u8]) -> Vec<u8> {
     k
 }
 
+/// (PLTE, tRNS) → PDS 条目 (entry_id, Y, Cr, Cb, Alpha)
+fn palette_entries(plte: &[[u8; 3]], trns: &[u8], bt709: bool) -> Vec<[u8; 5]> {
+    plte.iter()
+        .enumerate()
+        .map(|(i, c)| {
+            let a = trns.get(i).copied().unwrap_or(255);
+            let (y, cr, cb) = rgb_to_ycrcb(*c, bt709);
+            [i as u8, y, cr, cb, a]
+        })
+        .collect()
+}
+
+/// 索引 PNG → 逐像素 RGBA（decode_png 已保证索引 0 是透明色）
+fn png_rgba(p: &Png) -> Vec<[u8; 4]> {
+    p.idx
+        .iter()
+        .map(|&k| {
+            let i = k as usize;
+            let c = p.plte.get(i).copied().unwrap_or([0, 0, 0]);
+            let a = p.trns.get(i).copied().unwrap_or(255);
+            [c[0], c[1], c[2], a]
+        })
+        .collect()
+}
+
+/// PDS 差分：只保留与上一帧不同的条目。PGS 解码器按 entry_id 累积调色板，
+/// 因此 palette update 显示集只需携带变化的项。
+fn palette_diff(prev: &[[u8; 5]], cur: &[[u8; 5]]) -> Vec<[u8; 5]> {
+    let mut out = Vec::new();
+    for e in cur {
+        let same = prev.iter().any(|p| p[0] == e[0] && *p == *e);
+        if !same {
+            out.push(*e);
+        }
+    }
+    out
+}
+
+/// 把 N 帧 RGBA 压成「一张共用位图 + N 个调色板」——调色板渐变的核心。
+///
+/// 每个像素在 N 帧上的 RGBA 序列是一个特征：序列相同就能共用同一个 palette
+/// entry，于是 N 帧只需一张 ODS 位图，靠逐帧 PDS 换颜色/透明度还原动画。
+/// 全透明序列固定占 entry 0（PGS RLE 把索引 0 当透明行程）。序列种类超过
+/// 255（PGS 调色板容量）时返回 None，调用方整条链回退逐帧 ODS，**不引入
+/// 任何近似误差**。
+fn build_fade_chain(
+    frames: &[Vec<[u8; 4]>],
+    w: u32,
+    h: u32,
+    bt709: bool,
+) -> Option<(Vec<u8>, Vec<Vec<[u8; 5]>>)> {
+    let n = frames.len();
+    if n < 2 {
+        return None;
+    }
+    let npix = (w as usize).checked_mul(h as usize)?;
+    if npix == 0 || npix.checked_mul(n)?.checked_mul(4)? > FADE_MAX_SEQ_BYTES {
+        return None;
+    }
+    if frames.iter().any(|f| f.len() != npix) {
+        return None;
+    }
+    let mut ids: HashMap<Vec<u8>, u8> = HashMap::new();
+    let mut reps: Vec<Vec<u8>> = Vec::new();
+    let mut bitmap = vec![0u8; npix];
+    let mut seq = vec![0u8; n * 4];
+    for p in 0..npix {
+        for (t, f) in frames.iter().enumerate() {
+            seq[t * 4..t * 4 + 4].copy_from_slice(&f[p]);
+        }
+        if (0..n).all(|t| seq[t * 4 + 3] == 0) {
+            continue; // 全透明 → entry 0
+        }
+        let id = match ids.get(seq.as_slice()) {
+            Some(&v) => v,
+            None => {
+                let v = reps.len() + 1;
+                if v > 255 {
+                    return None;
+                }
+                let v = v as u8;
+                ids.insert(seq.clone(), v);
+                reps.push(seq.clone());
+                v
+            }
+        };
+        bitmap[p] = id;
+    }
+    let mut pals = Vec::with_capacity(n);
+    for t in 0..n {
+        let mut entries = Vec::with_capacity(1 + reps.len());
+        entries.push([0u8, 16, 128, 128, 0]); // entry 0 恒透明
+        for (k, rep) in reps.iter().enumerate() {
+            let o = t * 4;
+            let (y, cr, cb) = rgb_to_ycrcb([rep[o], rep[o + 1], rep[o + 2]], bt709);
+            entries.push([(k + 1) as u8, y, cr, cb, rep[o + 3]]);
+        }
+        pals.push(entries);
+    }
+    Some((bitmap, pals))
+}
+
+/// 在一个 epoch 内扫描可压成调色板动画的连续事件链。
+/// 条件：单 Graphic、尺寸与位置完全相同、时间首尾相接、序列种类 ≤255。
+fn find_fade_chains(
+    group: &[usize],
+    bdn: &Bdn,
+    times: &[(u32, u32)],
+    dir: &Path,
+    bt709: bool,
+) -> Vec<FadeChain> {
+    let mut out = Vec::new();
+    let mut k = 0usize;
+    while k < group.len() {
+        let ev0 = &bdn.events[group[k]];
+        if ev0.gs.len() != 1 {
+            k += 1;
+            continue;
+        }
+        let g0 = &ev0.gs[0];
+        let mut j = k + 1;
+        while j < group.len() && j - k < FADE_MAX_FRAMES {
+            let ei = group[j];
+            let ev = &bdn.events[ei];
+            if ev.gs.len() != 1 {
+                break;
+            }
+            let g = &ev.gs[0];
+            if g.w != g0.w || g.h != g0.h || g.x != g0.x || g.y != g0.y {
+                break;
+            }
+            if times[ei].0 != times[group[j - 1]].1 {
+                break;
+            }
+            j += 1;
+        }
+        if j - k >= 2 {
+            let mut frames = Vec::with_capacity(j - k);
+            let mut ok = true;
+            for q in k..j {
+                match decode_png(&dir.join(&bdn.events[group[q]].gs[0].file)) {
+                    Ok(p) if p.w == g0.w && p.h == g0.h => frames.push(png_rgba(&p)),
+                    _ => {
+                        ok = false;
+                        break;
+                    }
+                }
+            }
+            if ok {
+                if let Some((bitmap, pals)) = build_fade_chain(&frames, g0.w, g0.h, bt709) {
+                    let rle = rle_encode(&bitmap, g0.w as usize, g0.h as usize);
+                    out.push(FadeChain {
+                        start: k,
+                        end: j,
+                        rle,
+                        pals,
+                        w: g0.w,
+                        h: g0.h,
+                        x: g0.x,
+                        y: g0.y,
+                        forced: ev0.forced,
+                    });
+                    k = j;
+                    continue;
+                }
+            }
+        }
+        k += 1;
+    }
+    out
+}
+
+/// 一条可无损压成「一张共用位图 + 逐帧调色板」的动画链。
+///
+/// 与 SUPer 的 PaletteSequenceEffect 同理，但不做有损聚类：把每个像素在 N 帧上的
+/// RGBA 序列当作特征，序列种类不超过 PGS 调色板容量时才能用同一个 palette entry
+/// 精确表达；超过就整条链回退到逐帧 ODS，绝不引入近似误差。
+struct FadeChain {
+    /// group 内起始下标
+    start: usize,
+    /// group 内结束下标（不含）
+    end: usize,
+    /// 共用位图的 RLE
+    rle: Vec<u8>,
+    /// 每帧 PDS 条目：(entry_id, Y, Cr, Cb, Alpha)
+    pals: Vec<Vec<[u8; 5]>>,
+    w: u32,
+    h: u32,
+    x: u32,
+    y: u32,
+    forced: bool,
+}
+
 struct Ds {
     pts: u32,
     state: u8,
     win: Option<(u32, u32, u32, u32)>,
-    pal: Option<(Vec<[u8; 3]>, Vec<u8>)>,
+    /// PDS 条目：(entry_id, Y, Cr, Cb, Alpha)。None 表示本显示集不发 PDS
+    pal: Option<Vec<[u8; 5]>>,
     objs: Vec<(u16, u8, u32, u32, Vec<u8>)>,
     refs: Vec<(u16, u32, u32, bool)>,
     comp_no: u16,
+    /// PCS 的 palette_update_flag：本显示集只换调色板，composition 不变
+    pal_upd: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -688,8 +889,8 @@ fn push_ods(
 
 /// 把 BDN XML + 索引 PNG 编成一条完整 PGS 流，写到 `out`。
 ///
-/// `vw`/`vh` 传 0 时自动按 XML 的 VideoFormat 推断。
-pub fn encode(xml: &Path, out: &Path, vw: u32, vh: u32) -> Result<Value, String> {
+/// `vw`/`vh` 传 0 时自动按 XML 的 VideoFormat 推断；`fade` 打开调色板渐变优化。
+pub fn encode(xml: &Path, out: &Path, vw: u32, vh: u32, fade: bool) -> Result<Value, String> {
     let bdn = parse_bdn(xml)?;
     let (aw, ah) = video_size(&bdn.vfmt);
     let vw = if vw == 0 { aw } else { vw };
@@ -706,12 +907,103 @@ pub fn encode(xml: &Path, out: &Path, vw: u32, vh: u32) -> Result<Value, String>
     let groups = group_epochs(&bdn, &times);
     let mut dss: Vec<Ds> = Vec::new();
     let mut reused = 0usize;
+    let mut n_fade_chains = 0usize;
+    let mut n_fade_frames = 0usize;
+    let mut n_pal_upd = 0usize;
 
     for (gi, group) in groups.iter().enumerate() {
         let win = bbox(group, &bdn, vw, vh);
         let mut slots: Vec<Slot> = Vec::new();
         let mut comp_no = 0u16;
+        let chains = if fade {
+            find_fade_chains(group, &bdn, &times, dir, bt709)
+        } else {
+            Vec::new()
+        };
+        n_fade_chains += chains.len();
+        let mut skip_until = 0usize;
         for (k, &ei) in group.iter().enumerate() {
+            if k < skip_until {
+                continue;
+            }
+
+            // ---------- 调色板动画链：一张共用 ODS + 逐帧 PDS ----------
+            if let Some(ch) = chains.iter().find(|c| c.start == k) {
+                let n = ch.end - ch.start;
+                // 共用位图注册成一个普通 object，key 加前缀避免与单帧位图撞车
+                let mut key = b"FADE".to_vec();
+                key.extend_from_slice(&ch.rle);
+                let found = slots.iter().find(|s| s.key == key).map(|s| (s.id, s.ver));
+                let (id, ver) = match found {
+                    Some(p) => p,
+                    None => {
+                        let id = slots.len() as u16;
+                        slots.push(Slot { id, ver: 0, key });
+                        (id, 0)
+                    }
+                };
+                // PU 的 composition objects 必须与链首逐字节相同（SUPer verifier 硬约束）
+                let refs = vec![(id, ch.x, ch.y, ch.forced)];
+                dss.push(Ds {
+                    pts: ticks(times[group[ch.start]].0, bdn.fps),
+                    state: if k == 0 { ST_EPOCH } else { ST_ACQ },
+                    win: Some(win),
+                    pal: Some(ch.pals[0].clone()),
+                    objs: vec![(id, ver, ch.w, ch.h, ch.rle.clone())],
+                    refs: refs.clone(),
+                    comp_no,
+                    pal_upd: false,
+                });
+                comp_no = comp_no.wrapping_add(1);
+                for f in 1..n {
+                    let diff = palette_diff(&ch.pals[f - 1], &ch.pals[f]);
+                    // 差分空说明画面未变；仍发一条全量 PDS 保证版本递增、PDS 非空
+                    let pal = if diff.is_empty() { ch.pals[f].clone() } else { diff };
+                    dss.push(Ds {
+                        pts: ticks(times[group[ch.start + f]].0, bdn.fps),
+                        state: ST_NORMAL,
+                        win: None,
+                        pal: Some(pal),
+                        objs: Vec::new(),
+                        refs: refs.clone(),
+                        comp_no,
+                        pal_upd: true,
+                    });
+                    comp_no = comp_no.wrapping_add(1);
+                    n_pal_upd += 1;
+                }
+                n_fade_frames += n;
+                // 链尾按其最后一帧的 OutTC 判断是否补清屏
+                let out_pts = ticks(times[group[ch.end - 1]].1, bdn.fps);
+                let next_in = if ch.end < group.len() {
+                    Some(ticks(times[group[ch.end]].0, bdn.fps))
+                } else if gi + 1 < groups.len() {
+                    Some(ticks(times[groups[gi + 1][0]].0, bdn.fps))
+                } else {
+                    None
+                };
+                let need_clear = match next_in {
+                    Some(nx) => nx > out_pts,
+                    None => true,
+                };
+                if need_clear {
+                    dss.push(Ds {
+                        pts: out_pts,
+                        state: ST_NORMAL,
+                        win: None,
+                        pal: None,
+                        objs: Vec::new(),
+                        refs: Vec::new(),
+                        comp_no,
+                        pal_upd: false,
+                    });
+                    comp_no = comp_no.wrapping_add(1);
+                }
+                skip_until = ch.end;
+                continue;
+            }
+
+            // ---------- 普通单事件 ----------
             let ev = &bdn.events[ei];
             let mut bmps: Vec<(Bmp, Vec<[u8; 3]>, Vec<u8>)> = Vec::new();
             for g in &ev.gs {
@@ -788,10 +1080,11 @@ pub fn encode(xml: &Path, out: &Path, vw: u32, vh: u32) -> Result<Value, String>
                 pts: in_pts,
                 state,
                 win: if state == ST_NORMAL { None } else { Some(win) },
-                pal: Some(pal),
+                pal: Some(palette_entries(&pal.0, &pal.1, bt709)),
                 objs,
                 refs,
                 comp_no,
+                pal_upd: false,
             });
             comp_no = comp_no.wrapping_add(1);
 
@@ -817,6 +1110,7 @@ pub fn encode(xml: &Path, out: &Path, vw: u32, vh: u32) -> Result<Value, String>
                     objs: Vec::new(),
                     refs: Vec::new(),
                     comp_no,
+                    pal_upd: false,
                 });
                 comp_no = comp_no.wrapping_add(1);
             }
@@ -854,7 +1148,7 @@ pub fn encode(xml: &Path, out: &Path, vw: u32, vh: u32) -> Result<Value, String>
         p.push(bdn.fps_id << 4);
         p.extend_from_slice(&d.comp_no.to_be_bytes());
         p.push(d.state << 6);
-        p.push(0u8); // palette_update = false
+        p.push(if d.pal_upd { 0x80 } else { 0u8 }); // palette_update_flag
         p.push(0u8); // palette_id = 0
         p.push(d.refs.len() as u8);
         for &(id, x, y, forced) in &d.refs {
@@ -877,18 +1171,21 @@ pub fn encode(xml: &Path, out: &Path, vw: u32, vh: u32) -> Result<Value, String>
             push_seg(&mut buf, WDS, pts, dts, &q)?;
             n_wds += 1;
         }
-        if let Some((plte, trns)) = &d.pal {
-            let mut q = Vec::with_capacity(2 + plte.len() * 5);
+        // Acquisition / Epoch Start 会重置解码器里的调色板状态，版本重新从 0 起算；
+        // 其余显示集沿用递增版本号（SUPer verifier 要求同一 palette_id 逐次 +1）。
+        if d.state != ST_NORMAL {
+            pal_ver = 0;
+        }
+        if let Some(entries) = &d.pal {
+            let mut q = Vec::with_capacity(2 + entries.len() * 5);
             q.push(0u8); // palette_id
             q.push(pal_ver);
-            for (i, c) in plte.iter().enumerate() {
-                let a = trns.get(i).copied().unwrap_or(255);
-                let (y, cr, cb) = rgb_to_ycrcb(*c, bt709);
-                q.push(i as u8);
-                q.push(y);
-                q.push(cr);
-                q.push(cb);
-                q.push(a);
+            for e in entries {
+                q.push(e[0]); // entry_id
+                q.push(e[1]); // Y
+                q.push(e[2]); // Cr
+                q.push(e[3]); // Cb
+                q.push(e[4]); // alpha
             }
             push_seg(&mut buf, PDS, pts, 0, &q)?;
             pal_ver = pal_ver.wrapping_add(1);
@@ -919,6 +1216,9 @@ pub fn encode(xml: &Path, out: &Path, vw: u32, vh: u32) -> Result<Value, String>
         "pcs": n_pcs, "wds": n_wds, "pds": n_pds, "ods": n_ods, "end": n_end,
         "events": bdn.events.len(),
         "objects_reused": reused,
+        "palette_updates": n_pal_upd,
+        "fade_chains": n_fade_chains,
+        "fade_frames": n_fade_frames,
         "video": format!("{}x{}", vw, vh),
         "fps": bdn.fps,
         "lead_ticks": lead,
@@ -983,5 +1283,93 @@ mod tests {
         assert!(y >= 16 && y <= 235);
         assert!(cr >= 16 && cr <= 240);
         assert!(cb >= 16 && cb <= 240);
+    }
+
+    /// 把 RGBA 帧转成 PGS 调色板域（YCrCb + alpha），与 build_fade_chain 的输出同域
+    fn fade_domain(frames: &[Vec<[u8; 4]>], bt709: bool) -> Vec<Vec<[u8; 4]>> {
+        frames
+            .iter()
+            .map(|f| {
+                f.iter()
+                    .map(|c| {
+                        let (y, cr, cb) = rgb_to_ycrcb([c[0], c[1], c[2]], bt709);
+                        [y, cr, cb, c[3]]
+                    })
+                    .collect()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn fade_chain_is_lossless() {
+        // 3 帧淡入：同一张「文字」位图，alpha 逐级抬升，另有一块恒定色
+        let w = 9usize;
+        let h = 3usize;
+        let np = w * h;
+        let mk = |a: u8| -> Vec<[u8; 4]> {
+            (0..np)
+                .map(|p| {
+                    if p % 7 == 0 {
+                        [0, 0, 0, 0] // 全透明
+                    } else if p % 3 == 0 {
+                        [200, 30, 40, a] // 淡入主色
+                    } else {
+                        [16, 180, 90, 255] // 恒定色
+                    }
+                })
+                .collect()
+        };
+        let frames = vec![mk(0), mk(96), mk(255)];
+        let want = fade_domain(&frames, true);
+        let (bitmap, pals) = build_fade_chain(&frames, w as u32, h as u32, true).unwrap();
+        assert_eq!(bitmap.len(), np);
+        assert_eq!(pals.len(), 3);
+        // 共用位图 + 每帧调色板必须逐像素、逐帧还原出完全相同的调色板域颜色
+        for t in 0..3 {
+            for p in 0..np {
+                let id = bitmap[p] as usize;
+                let e = pals[t].iter().find(|e| e[0] as usize == id).unwrap();
+                assert_eq!([e[1], e[2], e[3], e[4]], want[t][p], "frame {t} pixel {p}");
+            }
+        }
+        // 全透明像素必须落在 entry 0
+        for p in (0..np).step_by(7) {
+            assert_eq!(bitmap[p], 0);
+        }
+        // 序列种类远小于容量：非透明序列应为 2 种
+        let uniq: std::collections::HashSet<u8> = bitmap.iter().copied().collect();
+        assert_eq!(uniq.len(), 3);
+    }
+
+    #[test]
+    fn fade_chain_over_capacity_falls_back() {
+        // 260 种各不相同的颜色序列 → 超过 255，必须回退
+        let frames: Vec<Vec<[u8; 4]>> = (0..2)
+            .map(|t| {
+                (0..300u32)
+                    .map(|i| [(i % 256) as u8, (i / 256) as u8, t as u8, 255])
+                    .collect()
+            })
+            .collect();
+        assert!(build_fade_chain(&frames, 300, 1, false).is_none());
+    }
+
+    #[test]
+    fn palette_diff_roundtrip() {
+        let a = vec![[0u8, 16, 128, 128, 0], [1, 200, 100, 90, 255], [2, 30, 40, 50, 128]];
+        let b = vec![[0u8, 16, 128, 128, 0], [1, 200, 100, 90, 200], [2, 30, 40, 50, 128]];
+        let diff = palette_diff(&a, &b);
+        assert_eq!(diff, vec![[1u8, 200, 100, 90, 200]]);
+        // 把差分覆盖回累积调色板，应还原出 b
+        let mut acc = a.clone();
+        for e in diff {
+            if let Some(slot) = acc.iter_mut().find(|s| s[0] == e[0]) {
+                *slot = e;
+            } else {
+                acc.push(e);
+            }
+        }
+        assert_eq!(acc, b);
+        assert!(palette_diff(&a, &a).is_empty());
     }
 }

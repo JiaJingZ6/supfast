@@ -126,10 +126,18 @@ struct Ds {
     wds: Vec<u8>,
     /// PCS 引用的 (object_id, window_id)
     refs: Vec<(u16, u8)>,
+    /// PCS 的 palette_update_flag：本显示集只换调色板
+    pal_upd: bool,
+    /// PCS 里 composition objects 的原始字节（用于逐字节比较连续性）
+    cobjs: Vec<u8>,
+    /// PCS 里 composition objects 的个数
+    nref: usize,
     /// PCS 指定的 palette_id
     palette_id: u8,
     /// 本显示集里 PDS 定义的 palette_id
     pds_ids: Vec<u8>,
+    /// 本显示集里 PDS 的 palette_version（按段顺序）
+    pds_vers: Vec<u8>,
     /// 本显示集里 WDS 定义的 window_id
     wds_ids: Vec<u8>,
     /// ODS 分片：(object_id, sequence_flag, 首片声明的 data_length, 本片数据字节数)
@@ -226,6 +234,7 @@ fn verify_sup_bytes(data: &[u8]) -> Value {
                 // 之后每个对象 object_id(2) window_id(1) cropped(1) x(2) y(2)
                 let p = s.payload;
                 let palette_id = p.get(9).copied().unwrap_or(0);
+                let pal_upd = p.get(8).copied().unwrap_or(0) & 0x80 != 0;
                 let nref = p.get(10).copied().unwrap_or(0) as usize;
                 let mut refs = Vec::new();
                 for k in 0..nref.min(16) {
@@ -235,11 +244,17 @@ fn verify_sup_bytes(data: &[u8]) -> Value {
                     }
                     refs.push((u16::from_be_bytes([p[o], p[o + 1]]), p[o + 2]));
                 }
+                let cobjs = if nref > 0 {
+                    let end = (11 + nref.min(16) * 8).min(p.len());
+                    if end > 11 { p[11..end].to_vec() } else { Vec::new() }
+                } else {
+                    Vec::new()
+                };
                 cur = Some(Ds {
                     pts: s.pts, dts: s.dts, state, bytes: s.bytes as u64,
                     has_end: false, window_area: 0, objs: Vec::new(),
-                    wds: Vec::new(), refs, palette_id,
-                    pds_ids: Vec::new(), wds_ids: Vec::new(),
+                    wds: Vec::new(), refs, pal_upd, cobjs, nref, palette_id,
+                    pds_ids: Vec::new(), pds_vers: Vec::new(), wds_ids: Vec::new(),
                     ods_frags: Vec::new(), off: s.off,
                 });
             }
@@ -271,6 +286,7 @@ fn verify_sup_bytes(data: &[u8]) -> Value {
                             if let Some(&id) = s.payload.first() {
                                 d.pds_ids.push(id);
                             }
+                            d.pds_vers.push(s.payload.get(1).copied().unwrap_or(0));
                         }
                         ODS => {
                             if let Some(pair) = ods_area(s.payload) { d.objs.push(pair); }
@@ -452,6 +468,77 @@ fn verify_sup_bytes(data: &[u8]) -> Value {
             "{} 处 PCS 引用的 window_id 不在同组 WDS 里", bad_win));
     }
 
+    // ---------- 3c. palette update 显示集（只换调色板）----------
+    // 依据 SUPer bytestream/verifier.py: test_diplayset / is_compliant：
+    // PU 必须是 Normal Case、不带 WDS/ODS、必带 PDS、composition objects 非空且
+    // 与上一个显示集逐字节相同。PU 是可选的合规优化，普通流里全部为 false。
+    let mut pal_updates = 0usize;
+    let mut pu_bad_state = 0usize;
+    let mut pu_bad_wds = 0usize;
+    let mut pu_bad_ods = 0usize;
+    let mut pu_bad_pds = 0usize;
+    let mut pu_no_cobj = 0usize;
+    let mut pu_cobj_changed = 0usize;
+    let mut pu_ver_bad = 0usize;
+    let mut last_cobjs: Option<Vec<u8>> = None;
+    let mut last_pal_ver: Option<u8> = None;
+    for d in &dss {
+        // Epoch Start 会清空解码器里的调色板与画面构成，跨 epoch 不能比较
+        if d.state == 0x80 {
+            last_cobjs = None;
+            last_pal_ver = None;
+        }
+        if d.pal_upd {
+            pal_updates += 1;
+            if d.state != 0x00 { pu_bad_state += 1; }
+            if !d.wds.is_empty() { pu_bad_wds += 1; }
+            if !d.ods_frags.is_empty() { pu_bad_ods += 1; }
+            if d.pds_ids.is_empty() || !d.pds_ids.contains(&d.palette_id) { pu_bad_pds += 1; }
+            if d.nref == 0 { pu_no_cobj += 1; }
+            match &last_cobjs {
+                Some(prev) if *prev != d.cobjs => pu_cobj_changed += 1,
+                None => pu_cobj_changed += 1,
+                _ => {}
+            }
+        } else if d.nref > 0 {
+            // 只有带 composition objects 的非 PU 显示集才更新「上一次画面构成」
+            last_cobjs = Some(d.cobjs.clone());
+        }
+        // 同一 palette_id 的 PDS 版本需逐次 +1
+        //（SUPer bytestream/verifier.py:is_compliant，否则解码器可能丢弃调色板）
+        if let Some(&v) = d.pds_vers.first() {
+            if d.pal_upd {
+                if let Some(pv) = last_pal_ver {
+                    if v != pv.wrapping_add(1) { pu_ver_bad += 1; }
+                }
+            }
+            last_pal_ver = Some(v);
+        }
+    }
+    if pal_updates > 0 {
+        let mut chk = |n: usize, code: &'static str, msg: String| {
+            if n > 0 { add(&mut issues, "error", code, msg); }
+        };
+        chk(pu_bad_state, "PU_BAD_STATE",
+            format!("{} 组 palette update 显示集不是 Normal Case", pu_bad_state));
+        chk(pu_bad_wds, "PU_WITH_WDS",
+            format!("{} 组 palette update 显示集带了 WDS（同一显示集内不能既改窗口又换调色板）", pu_bad_wds));
+        chk(pu_bad_ods, "PU_WITH_ODS",
+            format!("{} 组 palette update 显示集带了 ODS（调色板动画不该重传位图）", pu_bad_ods));
+        chk(pu_bad_pds, "PU_BAD_PDS",
+            format!("{} 组 palette update 显示集缺 PDS 或 palette_id 不匹配", pu_bad_pds));
+        chk(pu_no_cobj, "PU_NO_COBJ",
+            format!("{} 组 palette update 显示集没有 composition objects", pu_no_cobj));
+        if pu_cobj_changed > 0 {
+            add(&mut issues, "warn", "PU_COBJ_CHANGED", format!(
+                "{} 组 palette update 的 composition objects 与上一个画面构成不一致", pu_cobj_changed));
+        }
+        if pu_ver_bad > 0 {
+            add(&mut issues, "warn", "PU_PDS_VERSION", format!(
+                "{} 组 palette update 的 PDS 版本不是逐次 +1，解码器可能丢弃该调色板", pu_ver_bad));
+        }
+    }
+
     // ---------- 4. 时序 ----------
     // DTS==0 是 PDS/END 的「不适用」，必须排除，否则整片误报
     let mut eq_pts_dts = 0usize;
@@ -577,6 +664,9 @@ fn verify_sup_bytes(data: &[u8]) -> Value {
         "dts_back": dts_back,
         "tight_ds": tight,
         "decode_need_max_ticks": worst_need,
+        "palette_updates": pal_updates,
+        "pu_cobj_changed": pu_cobj_changed,
+        "pu_pds_version_bad": pu_ver_bad,
     });
 
     let mut lines: Vec<Value> = Vec::new();
@@ -605,6 +695,12 @@ fn verify_sup_bytes(data: &[u8]) -> Value {
         if dts_back == 0 { "非递减 OK" } else { "有回退" },
         eq_pts_dts, tight
     ));
+    if pal_updates > 0 {
+        put(&mut lines, "dim", format!(
+            "调色板动画  palette update {} 组 · 画面构成不一致 {} · PDS 版本跳变 {}（均应为 0）",
+            pal_updates, pu_cobj_changed, pu_ver_bad
+        ));
+    }
     for x in errs.iter().take(MAX_LINE_ISSUES) {
         put(&mut lines, "err", format!("✗ [{}] {}", x.code, x.msg));
     }

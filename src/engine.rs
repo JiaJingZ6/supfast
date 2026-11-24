@@ -841,6 +841,8 @@ struct RunOpts {
     super_cmd: String,
     /// 可选后端：用内置的 Rust 原生 PGS 编码器整流生成 <名>.native.sup（零外部依赖）
     native_pgs: bool,
+    /// 原生编码器是否启用调色板渐变（淡入淡出 / 卡拉OK）优化，默认开
+    palette_fade: bool,
 }
 
 fn read_opts(v: &Value) -> Result<RunOpts, String> {
@@ -895,6 +897,7 @@ fn read_opts(v: &Value) -> Result<RunOpts, String> {
         super_encode: pick_flag(v, "super_encode", false),
         super_cmd: pick_str(v, "super_cmd"),
         native_pgs: pick_flag(v, "native_pgs", false),
+        palette_fade: pick_flag(v, "palette_fade", true),
     })
 }
 
@@ -1663,7 +1666,7 @@ pub fn convert(opts: &Value, emit: Emit, cancel: Arc<AtomicBool>) -> Result<Valu
         let native_report = if o.native_pgs {
             emit(json!({"t":"stage","name":"native_pgs"}));
             let nat = outdir.join(format!("{}.native.sup", base));
-            match crate::pgs::encode(out_xml.as_path(), &nat, w, h) {
+            match crate::pgs::encode(out_xml.as_path(), &nat, w, h, o.palette_fade) {
                 Ok(mut rep) => {
                     rep["verify"] = crate::verify::verify_sup_file(&nat).unwrap_or_else(|e| json!({
                         "ok": false, "compliant": false,
@@ -1735,6 +1738,7 @@ pub fn probe_env(mod_root: Option<&str>, super_cmd: &str) -> Value {
         super_encode: false,
         super_cmd: String::new(),
         native_pgs: false,
+        palette_fade: true,
     };
     let found = locate_exe(&o);
     let (exe_s, dll_s, dir_s) = match &found {

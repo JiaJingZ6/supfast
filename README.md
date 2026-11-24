@@ -1,7 +1,7 @@
 # supfast
 
 把 ASS / SSA 字幕按「画面是否变化」切成段，只渲染必要的帧，输出 PGS（`.sup`）与 BDN（`.xml`）。
-内置 Rust PGS 编码器可把同一份 BDN 一次性整流成严格合规的流，不需要 Python 或外部编码器。
+内置 Rust PGS 编码器可把同一份 BDN 一次性整流成严格合规的流（含无损调色板渐变），不需要 Python 或外部编码器。
 
 给压制组、字幕组和 DIY 蓝光用的：一条 1 小时 44 分的片子，只要 2.4% 的帧真的在动，
 剩下 97.6% 的画面是静止的 —— 静止段只需要渲染段首那一帧。
@@ -33,7 +33,7 @@
 
 - **预设**一键套用输出规格：蓝光 23.976/1080p、PAL 高清 25/1080p、DVD 25/480p、电视 29.97/1080i。
 - **高级选项**（折叠）里是分辨率覆盖、mod 目录、七个合成开关，以及可选的
-  Rust 原生 PGS 整流与 SUPer 重编码。
+  Rust 原生 PGS 整流（内含「调色板渐变」开关）与 SUPer 重编码。
 
 | 开关 | 传给 avs2bdnxml | 作用 |
 |---|---|---|
@@ -127,6 +127,7 @@ display set buffering 提前解码，不能只看单个显示集的 `PTS−DTS`�
 | RLE | 标准 PGS 行程编码；单个对象超过 65535 字节自动切 FIRST / 中间 / LAST 分片 |
 | epoch | 按 object buffer（面积 3 MiB 预算、60 个对象上限）与 2 秒空档把事件串分组，epoch 内窗口定义固定 |
 | 对象复用 | 同一 epoch 内「位图 + 调色板」完全相同就复用 `object_id`，走 Normal Case，不重传 ODS |
+| 调色板渐变 | 连续同图、仅逐帧变色的事件压成「一张位图 + 逐帧调色板」，后续帧只发 palette update 显示集；序列种类超 255 时整链回退逐帧 ODS（零画质损失），详见下节 |
 | 显示集 | 组首 Epoch Start、新位图 Acquisition Point、空档补清屏显示集；Epoch Start / Acquisition 都带同一份 WDS |
 | 时序 | 同一显示集共用 PTS 与 DTS，`DTS = PTS − 按分辨率算的解码提前量`（全片常量、随 PTS 单调）；PDS / END 的 DTS 写 0 =「不适用」 |
 
@@ -141,9 +142,40 @@ SUP 从 3.37 MB 降到 1.32 MB；`drama.ass` 的图几乎张张不同，体积�
 不需要 `avs2bdnxml` 的 SUP 输出、不需要 Python / SUPer；只多一个纯 Rust 的 `flate2`
 （解压 PNG 的 zlib 数据），无 DLL、静态链接。两套 SUP 都会在日志页各跑一次合规自检。
 
-**暂不支持**（后续阶段）：淡入淡出 / 卡拉OK 的调色板渐变、SSIM 帧间对象拆分、
-窗口布局优化。需要这些特效仍走下面的 SUPer 后端。另外，单个显示集超过 1 MiB 会直接
-报错而不是产出超 RX 缓冲的流 —— 常规字幕用不到，全屏大图需要注意。
+### 调色板渐变（淡入淡出 / 卡拉OK）
+
+默认开启，在「高级选项 → Rust 原生 PGS → 调色板渐变」可关；命令行用
+`--no-palette-fade` 关闭（对 `--engine pgs` 和 `--engine convert --native-pgs` 都生效）。
+
+原理与 SUPer 的 `PaletteSequenceEffect` 相同，但**不做有损聚类**：
+
+| 步骤 | 做法 |
+|---|---|
+| 候选链 | 同一 epoch 内，连续事件都是单个 Graphic、尺寸与 X/Y 完全相同、时间首尾相接（淡入淡出 / 卡拉OK 逐帧变色的典型形态），最多 512 帧 |
+| 反量化 | `png_rgba` 把每帧索引 PNG 还原成逐像素 RGBA，以「每个像素在 N 帧上的 RGBA 序列」为特征 |
+| 共用位图 | 序列相同的像素共用同一个 palette entry，全透明序列固定占 entry 0；序列种类 ≤255 时生成一张共用 ODS 位图 |
+| 逐帧调色板 | 链首发 Epoch Start / Acquisition（WDS + PDS + ODS），后续每帧只发一条 Normal Case 的 **palette update 显示集**：PCS 置 `palette_update_flag=0x80`、不带 WDS/ODS、`palette_diff` 只发与上一帧不同的条目、composition objects 与链首逐字节相同，PDS 版本逐次 +1 |
+| 无损回退 | 序列种类 >255（超出 PGS 调色板容量）时**整条链回退**逐帧 ODS，不引入任何近似误差 |
+
+因此渐变帧不重传位图，只换颜色/透明度。`verify` 新增 `PU_BAD_STATE` / `PU_WITH_WDS` /
+`PU_WITH_ODS` / `PU_BAD_PDS` / `PU_NO_COBJ` / `PU_COBJ_CHANGED` / `PU_PDS_VERSION` 七项检查，
+日志页在有渐变链时会多一行「调色板动画」。
+
+实测（8 帧同一张 64×24 位图、alpha 0→255 淡入 + 255→0 淡出的合成样本）：
+
+| 模式 | 体积 | 显示集 | ODS 组 | palette update | 逐像素比对 |
+|---|---|---|---|---|---|
+| 渐变开 | 910 B | 9 | 1 | 7 | 12,288 采样 0 误差 |
+| 渐变关 | 3,101 B | 9 | 8 | 0 | 12,288 采样 0 误差 |
+
+真实素材上 `test2.ass` 没有可用链，产物体积与阶段一相同（仅 PDS 版本号按
+Acquisition Point 重置为 0，画面零变化）；`drama.ass` 识别出 1 条 2 帧链，
+体积 42,168,329 B（阶段一 42,176,509 B）。两者自检均 0 错 0 警、严格合规。
+用 SUPer 的 verifier 交叉验证，含渐变链的流结构检查 `is_compliant` 均返回
+`(True, 0)`（0 警告）。
+
+**暂不支持**（后续阶段）：SSIM 帧间对象拆分、窗口布局优化。另外，单个显示集超过 1 MiB
+会直接报错而不是产出超 RX 缓冲的流 —— 常规字幕用不到，全屏大图需要注意。
 
 ## SUPer 高质量 PGS（可选）
 
@@ -202,6 +234,8 @@ supfast.exe --engine convert --ass test.ass --super --super-cmd H://DIY//SUPer-c
 :: 对已有的 BDN XML + 同目录 PNG 单独跑原生编码器（不重渲字幕）
 supfast.exe --engine pgs --xml test2.xml --json pgs.json
 supfast.exe --engine pgs --xml test2.xml --out test2.native.sup --vw 1920 --vh 1080 --json pgs.json
+:: 关掉调色板渐变做对照（--engine convert --native-pgs 同样支持）
+supfast.exe --engine pgs --xml test2.xml --out test2.nofade.sup --no-palette-fade --json pgs.json
 ```
 
 - `analyze` 输出 events / frames / segs / sta / dyn / work / ratio / w / h，以及 `bands`（全片时间轴）与 `timeline`。
@@ -211,7 +245,9 @@ supfast.exe --engine pgs --xml test2.xml --out test2.native.sup --vw 1920 --vh 1
   super（SUPer 重编码报告）/ native（Rust 原生 PGS 报告），未开启的后端为 `null`。
 - `verify` 输出 ok / compliant / errors / warnings / stats / lines；`lines` 就是日志页显示的那几行。
 - `pgs` 输出 bytes / display_sets / epochs / pcs / wds / pds / ods / end / objects_reused /
-  lead_ticks，外加对产物的 `verify` 自检报告。`--vw`/`--vh` 省略时按 XML 的 VideoFormat 推断。
+  palette_updates / fade_chains / fade_frames / lead_ticks，外加对产物的 `verify` 自检报告。
+  `--vw`/`--vh` 省略时按 XML 的 VideoFormat 推断；`--no-palette-fade` 关闭调色板渐变。
+  `verify` 的 `stats` 里另有 `palette_updates` / `pu_cobj_changed` / `pu_pds_version_bad`。
 
 ## 编译
 
@@ -238,8 +274,8 @@ dist\
 ├─ capabilities\default.json   主窗口权限（core:default、dialog、窗口控制）
 ├─ icons\icon.ico              4 根竖条，最后一根是强调橙（make_icon.py 生成）
 ├─ src\engine.rs               引擎：解析 → 切段 → 并行渲染 → 重写 XML / SUP
-├─ src\pgs.rs                  原生 PGS 编码器：PNG/RLE → epoch 规划 → 段序列化
-├─ src\verify.rs               SUP 合规自检（零依赖）
+├─ src\pgs.rs                  原生 PGS 编码器：PNG/RLE → epoch 规划 → 调色板渐变 → 段序列化
+├─ src\verify.rs               SUP 合规自检（零依赖，含 palette update 检查）
 ├─ src\superenc.rs             可选 SUPer 外部调用
 ├─ src\main.rs                 IPC 路由 + 状态持久化 + 命令行入口
 ├─ ui\index.html               界面（单文件 HTML + CSS + JS）
@@ -347,7 +383,15 @@ tools\winbox.exe min "Google Chrome"    :: 截图前把挡在前面的窗口最�
 - **没有安装包**：只产出 `exe` + `mod` 目录，绿色解压即用。
 - **SUPer 不随包分发**：可选的「高质量 PGS」后端需要自行安装 GPL-3.0 的 SUPer，
   见 [SUPer 高质量 PGS（可选）](#super-高质量-pgs可选)。内置的
-  [Rust 原生 PGS](#rust-原生-pgs内置--推荐) 不需要它，但没有淡入淡出 / 卡拉OK 的调色板渐变。
+  [Rust 原生 PGS](#rust-原生-pgs内置--推荐) 不需要它，已带无损的调色板渐变。
+- **两套 verifier 的时序模型不同**：文中的「0 错 0 警、严格合规」指 supfast 内置自检，
+  它按 HDMV PGS 解码器模型 + 拼段工具链惯例校准（`DTS = PTS − 常量提前量`，
+  PDS / END 的 DTS 写 0 表示「不适用」）。SUPer 的 `check_pts_dts_sanity` 用 buffered
+  display set 调度模型，额外要求相邻显示集 PTS 至少一帧间隔、PDS 的 `PTS == DTS`、
+  段级 DTS 单调且生命周期 < 1 秒，直接拿它判我们的整流流会报 PTS-DTS out of spec
+  —— 这是阶段一就存在的模型差异，不是调色板渐变引入的。结构层面两者一致：
+  SUPer 的 `is_compliant` 对含渐变链的流均返回 `(True, 0)`。要 SUPer 全项通过请直接用
+  [SUPer 后端](#super-高质量-pgs可选)。
 - 无边框窗口用 `data-tauri-drag-region` 拖动，**双击标题栏不会最大化**，用右上角按钮。
 - 目标机器需要 WebView2 运行时（Win10 1803+ 与 Win11 自带）。
 - 右键菜单是关掉的：WebView2 默认会弹「重新加载 / 另存为 / 打印 / 检查」，
