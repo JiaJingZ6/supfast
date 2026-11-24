@@ -843,6 +843,8 @@ struct RunOpts {
     native_pgs: bool,
     /// 原生编码器是否启用调色板渐变（淡入淡出 / 卡拉OK）优化，默认开
     palette_fade: bool,
+    /// 原生编码器是否启用帧间对象拆分（局部变化只重传变化的半区），默认开
+    object_split: bool,
 }
 
 fn read_opts(v: &Value) -> Result<RunOpts, String> {
@@ -898,6 +900,7 @@ fn read_opts(v: &Value) -> Result<RunOpts, String> {
         super_cmd: pick_str(v, "super_cmd"),
         native_pgs: pick_flag(v, "native_pgs", false),
         palette_fade: pick_flag(v, "palette_fade", true),
+        object_split: pick_flag(v, "object_split", true),
     })
 }
 
@@ -1666,7 +1669,7 @@ pub fn convert(opts: &Value, emit: Emit, cancel: Arc<AtomicBool>) -> Result<Valu
         let native_report = if o.native_pgs {
             emit(json!({"t":"stage","name":"native_pgs"}));
             let nat = outdir.join(format!("{}.native.sup", base));
-            match crate::pgs::encode(out_xml.as_path(), &nat, w, h, o.palette_fade) {
+            match crate::pgs::encode(out_xml.as_path(), &nat, w, h, o.palette_fade, o.object_split) {
                 Ok(mut rep) => {
                     rep["verify"] = crate::verify::verify_sup_file(&nat).unwrap_or_else(|e| json!({
                         "ok": false, "compliant": false,
@@ -1739,6 +1742,7 @@ pub fn probe_env(mod_root: Option<&str>, super_cmd: &str) -> Value {
         super_cmd: String::new(),
         native_pgs: false,
         palette_fade: true,
+        object_split: true,
     };
     let found = locate_exe(&o);
     let (exe_s, dll_s, dir_s) = match &found {

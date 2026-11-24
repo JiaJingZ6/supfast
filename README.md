@@ -128,6 +128,7 @@ display set buffering 提前解码，不能只看单个显示集的 `PTS−DTS`�
 | epoch | 按 object buffer（面积 3 MiB 预算、60 个对象上限）与 2 秒空档把事件串分组，epoch 内窗口定义固定 |
 | 对象复用 | 同一 epoch 内「位图 + 调色板」完全相同就复用 `object_id`，走 Normal Case，不重传 ODS |
 | 调色板渐变 | 连续同图、仅逐帧变色的事件压成「一张位图 + 逐帧调色板」，后续帧只发 palette update 显示集；序列种类超 255 时整链回退逐帧 ODS（零画质损失），详见下节 |
+| 帧间对象拆分 | 连续单图局部变化时，按最优分割线把每帧切成 2 个对象，逐帧只重传变化的那一块；无净收益或超预算就整链回退，同样零画质损失，详见下节 |
 | 显示集 | 组首 Epoch Start、新位图 Acquisition Point、空档补清屏显示集；Epoch Start / Acquisition 都带同一份 WDS |
 | 时序 | 同一显示集共用 PTS 与 DTS，`DTS = PTS − 按分辨率算的解码提前量`（全片常量、随 PTS 单调）；PDS / END 的 DTS 写 0 =「不适用」 |
 
@@ -174,8 +175,45 @@ Acquisition Point 重置为 0，画面零变化）；`drama.ass` 识别出 1 条
 用 SUPer 的 verifier 交叉验证，含渐变链的流结构检查 `is_compliant` 均返回
 `(True, 0)`（0 警告）。
 
-**暂不支持**（后续阶段）：SSIM 帧间对象拆分、窗口布局优化。另外，单个显示集超过 1 MiB
-会直接报错而不是产出超 RX 缓冲的流 —— 常规字幕用不到，全屏大图需要注意。
+### 帧间对象拆分（局部变化 / 滚动）
+
+默认开启，在「高级选项 → Rust 原生 PGS → 帧间对象拆分」可关；命令行用
+`--no-object-split` 关闭（对 `--engine pgs` 和 `--engine convert --native-pgs` 都生效）。
+
+SUPer 的 `ObjectDetector` 用 SSIM 阈值（约 0.986）判断连续帧能否并进同一个 object，
+只传一次 ODS —— 那是**有损近似**。supfast 做零画质损失的等价优化：
+
+| 步骤 | 做法 |
+|---|---|
+| 候选链 | 同一 epoch 内，连续事件都是单个 Graphic、尺寸与 X/Y 完全相同、时间首尾相接（≤128 帧），且与调色板动画链互斥（渐变优先、更省） |
+| 最优分割线 | 在宽/高的 1/4、1/3、1/2、2/3、3/4 共十条候选线里，按「唯一块数 × 段头 + 去重 RLE 字节 + 每帧多一个 composition object」估算净收益，取 ≥64 B 且最大的一条 |
+| 切块 | `split_rle` 把每帧索引矩阵按该线切成两个矩形各自做 PGS RLE；不重新量化、PLTE 不变，两块拼回去与原图逐像素一致 |
+| 逐块复用 | 每块用「PLTE + tRNS + RLE」查 epoch 内对象表，**完全一致才复用** `object_id`，只重传变化的那一块（PGS 单显示集最多 2 个 composition object） |
+| 回退 | 无净收益、`object_id` / object buffer 预算不足、调色板不一致，都整链回退逐帧 ODS |
+
+**一个容易踩的规范坑**：拆分链后续帧必须走 Normal Case，不能是 Acquisition Point。
+SUPer verifier 在 acquisition 时会清空对象缓冲（`ods_filled.clear()`），把复用旧对象
+判成 `Using expired memory`；Normal Case 不清空缓冲、且允许同集定义新对象，才能合法
+复用链首的恒定半区。`verify` 另加 `COBJ_TOO_MANY` / `COBJ_DUP_ID` 两项检查，
+`stats` 里有 `multi_obj_ds` / `max_cobjs`。
+
+实测（8 帧 320×64 合成样本：左半静态噪点、右半逐帧变色，255 色；RGBA 序列种类
+>255，调色板渐变回退、由拆分接管）：
+
+| 模式 | 体积 | 显示集 | ODS 段 | 每帧 composition objects | 逐像素比对 |
+|---|---|---|---|---|---|
+| 拆分开（默认） | **104,332 B** | 9 | 9（恒定半区只传 1 次） | 2 | 163,840 采样 0 误差 |
+| 全关 | 175,957 B | 9 | 8 | 1 | 163,840 采样 0 误差 |
+
+省 71,625 B / 40.7%。只开拆分（`--no-palette-fade`）与默认产物逐字节一致；只关拆分
+（`--no-object-split`）等于全关 —— 说明两条链确实互斥且渐变优先。SUPer verifier 结构
+检查 `is_compliant` 返回 `(True, 0)`。真实素材 `test2.ass` / `drama.ass` 没有符合条件
+的单图局部变化链，`split_chains=0`，产物与阶段二逐字节一致。
+
+**暂不支持**（后续阶段）：窗口布局优化，以及 SUPer 那种带 SSIM 容差的帧间合成
+（有损，本项目坚持零画质损失）。另外，单个显示集超过 1 MiB 会直接报错而不是产出
+超 RX 缓冲的流 —— 常规字幕用不到，全屏大图需要注意。输入 PNG 的颜色数也应 ≤255：
+PGS 要求 palette entry `0xFF` 是全透明保留项，若被用作可见色会直接报错而不是产出坏流。
 
 ## SUPer 高质量 PGS（可选）
 
@@ -234,8 +272,9 @@ supfast.exe --engine convert --ass test.ass --super --super-cmd H://DIY//SUPer-c
 :: 对已有的 BDN XML + 同目录 PNG 单独跑原生编码器（不重渲字幕）
 supfast.exe --engine pgs --xml test2.xml --json pgs.json
 supfast.exe --engine pgs --xml test2.xml --out test2.native.sup --vw 1920 --vh 1080 --json pgs.json
-:: 关掉调色板渐变做对照（--engine convert --native-pgs 同样支持）
+:: 关掉调色板渐变 / 帧间对象拆分做对照（--engine convert --native-pgs 同样支持）
 supfast.exe --engine pgs --xml test2.xml --out test2.nofade.sup --no-palette-fade --json pgs.json
+supfast.exe --engine pgs --xml test2.xml --out test2.nosplit.sup --no-object-split --json pgs.json
 ```
 
 - `analyze` 输出 events / frames / segs / sta / dyn / work / ratio / w / h，以及 `bands`（全片时间轴）与 `timeline`。
@@ -245,9 +284,12 @@ supfast.exe --engine pgs --xml test2.xml --out test2.nofade.sup --no-palette-fad
   super（SUPer 重编码报告）/ native（Rust 原生 PGS 报告），未开启的后端为 `null`。
 - `verify` 输出 ok / compliant / errors / warnings / stats / lines；`lines` 就是日志页显示的那几行。
 - `pgs` 输出 bytes / display_sets / epochs / pcs / wds / pds / ods / end / objects_reused /
-  palette_updates / fade_chains / fade_frames / lead_ticks，外加对产物的 `verify` 自检报告。
-  `--vw`/`--vh` 省略时按 XML 的 VideoFormat 推断；`--no-palette-fade` 关闭调色板渐变。
-  `verify` 的 `stats` 里另有 `palette_updates` / `pu_cobj_changed` / `pu_pds_version_bad`。
+  palette_updates / fade_chains / fade_frames / split_chains / split_frames /
+  split_objects_reused / lead_ticks，外加对产物的 `verify` 自检报告。
+  `--vw`/`--vh` 省略时按 XML 的 VideoFormat 推断；`--no-palette-fade` 关闭调色板渐变、
+  `--no-object-split` 关闭帧间对象拆分。`verify` 的 `stats` 里另有 `palette_updates` /
+  `pu_cobj_changed` / `pu_pds_version_bad` / `multi_obj_ds` / `max_cobjs` / `cobj_dup` /
+  `cobj_too_many`。
 
 ## 编译
 
@@ -274,8 +316,8 @@ dist\
 ├─ capabilities\default.json   主窗口权限（core:default、dialog、窗口控制）
 ├─ icons\icon.ico              4 根竖条，最后一根是强调橙（make_icon.py 生成）
 ├─ src\engine.rs               引擎：解析 → 切段 → 并行渲染 → 重写 XML / SUP
-├─ src\pgs.rs                  原生 PGS 编码器：PNG/RLE → epoch 规划 → 调色板渐变 → 段序列化
-├─ src\verify.rs               SUP 合规自检（零依赖，含 palette update 检查）
+├─ src\pgs.rs                  原生 PGS 编码器：PNG/RLE → epoch 规划 → 调色板渐变 / 帧间对象拆分 → 段序列化
+├─ src\verify.rs               SUP 合规自检（零依赖，含 palette update / 多对象显示集检查）
 ├─ src\superenc.rs             可选 SUPer 外部调用
 ├─ src\main.rs                 IPC 路由 + 状态持久化 + 命令行入口
 ├─ ui\index.html               界面（单文件 HTML + CSS + JS）
@@ -383,14 +425,14 @@ tools\winbox.exe min "Google Chrome"    :: 截图前把挡在前面的窗口最�
 - **没有安装包**：只产出 `exe` + `mod` 目录，绿色解压即用。
 - **SUPer 不随包分发**：可选的「高质量 PGS」后端需要自行安装 GPL-3.0 的 SUPer，
   见 [SUPer 高质量 PGS（可选）](#super-高质量-pgs可选)。内置的
-  [Rust 原生 PGS](#rust-原生-pgs内置--推荐) 不需要它，已带无损的调色板渐变。
+  [Rust 原生 PGS](#rust-原生-pgs内置--推荐) 不需要它，已带无损的调色板渐变与帧间对象拆分。
 - **两套 verifier 的时序模型不同**：文中的「0 错 0 警、严格合规」指 supfast 内置自检，
   它按 HDMV PGS 解码器模型 + 拼段工具链惯例校准（`DTS = PTS − 常量提前量`，
   PDS / END 的 DTS 写 0 表示「不适用」）。SUPer 的 `check_pts_dts_sanity` 用 buffered
   display set 调度模型，额外要求相邻显示集 PTS 至少一帧间隔、PDS 的 `PTS == DTS`、
   段级 DTS 单调且生命周期 < 1 秒，直接拿它判我们的整流流会报 PTS-DTS out of spec
-  —— 这是阶段一就存在的模型差异，不是调色板渐变引入的。结构层面两者一致：
-  SUPer 的 `is_compliant` 对含渐变链的流均返回 `(True, 0)`。要 SUPer 全项通过请直接用
+  —— 这是阶段一就存在的模型差异，不是调色板渐变 / 帧间对象拆分引入的。结构层面两者一致：
+  SUPer 的 `is_compliant` 对含渐变链、含拆分链的流均返回 `(True, 0)`。要 SUPer 全项通过请直接用
   [SUPer 后端](#super-高质量-pgs可选)。
 - 无边框窗口用 `data-tauri-drag-region` 拖动，**双击标题栏不会最大化**，用右上角按钮。
 - 目标机器需要 WebView2 运行时（Win10 1803+ 与 Win11 自带）。

@@ -132,6 +132,8 @@ struct Ds {
     cobjs: Vec<u8>,
     /// PCS 里 composition objects 的个数
     nref: usize,
+    /// PCS 里每个 composition object 的 (object_id, x, y)
+    cobj_xy: Vec<(u16, u32, u32)>,
     /// PCS 指定的 palette_id
     palette_id: u8,
     /// 本显示集里 PDS 定义的 palette_id
@@ -237,12 +239,20 @@ fn verify_sup_bytes(data: &[u8]) -> Value {
                 let pal_upd = p.get(8).copied().unwrap_or(0) & 0x80 != 0;
                 let nref = p.get(10).copied().unwrap_or(0) as usize;
                 let mut refs = Vec::new();
+                let mut cobj_xy = Vec::new();
                 for k in 0..nref.min(16) {
                     let o = 11 + k * 8;
                     if o + 3 > p.len() {
                         break;
                     }
-                    refs.push((u16::from_be_bytes([p[o], p[o + 1]]), p[o + 2]));
+                    let oid = u16::from_be_bytes([p[o], p[o + 1]]);
+                    refs.push((oid, p[o + 2]));
+                    // 布局：object_id(2) window_id(1) cropped(1) x(2) y(2)
+                    if o + 8 <= p.len() {
+                        let x = u16::from_be_bytes([p[o + 4], p[o + 5]]) as u32;
+                        let y = u16::from_be_bytes([p[o + 6], p[o + 7]]) as u32;
+                        cobj_xy.push((oid, x, y));
+                    }
                 }
                 let cobjs = if nref > 0 {
                     let end = (11 + nref.min(16) * 8).min(p.len());
@@ -254,6 +264,7 @@ fn verify_sup_bytes(data: &[u8]) -> Value {
                     pts: s.pts, dts: s.dts, state, bytes: s.bytes as u64,
                     has_end: false, window_area: 0, objs: Vec::new(),
                     wds: Vec::new(), refs, pal_upd, cobjs, nref, palette_id,
+                    cobj_xy,
                     pds_ids: Vec::new(), pds_vers: Vec::new(), wds_ids: Vec::new(),
                     ods_frags: Vec::new(), off: s.off,
                 });
@@ -539,6 +550,32 @@ fn verify_sup_bytes(data: &[u8]) -> Value {
         }
     }
 
+    // ---------- 3d. 多对象显示集（帧间对象拆分）----------
+    // PGS 一个 PCS 最多 2 个 composition object。拆分流会稳定出现 nref==2。
+    // 只做统计与两条确定的结构约束，不臆造「对象必须落在窗口内」之类规则，
+    // 避免像早期 PTS_EQ_DTS 那样误伤合规流。
+    let mut multi_obj_ds = 0usize;
+    let mut max_cobjs = 0usize;
+    let mut dup_cobj = 0usize;
+    let mut too_many_cobj = 0usize;
+    for d in &dss {
+        max_cobjs = max_cobjs.max(d.nref);
+        if d.nref > 1 { multi_obj_ds += 1; }
+        if d.nref > 2 { too_many_cobj += 1; }
+        let mut local: HashSet<u16> = HashSet::new();
+        for (oid, _x, _y) in &d.cobj_xy {
+            if !local.insert(*oid) { dup_cobj += 1; }
+        }
+    }
+    if too_many_cobj > 0 {
+        add(&mut issues, "error", "COBJ_TOO_MANY", format!(
+            "{} 组显示集的 composition objects 超过 2 个（PGS 单显示集上限）", too_many_cobj));
+    }
+    if dup_cobj > 0 {
+        add(&mut issues, "error", "COBJ_DUP_ID", format!(
+            "{} 处同一显示集内重复引用同一个 object_id", dup_cobj));
+    }
+
     // ---------- 4. 时序 ----------
     // DTS==0 是 PDS/END 的「不适用」，必须排除，否则整片误报
     let mut eq_pts_dts = 0usize;
@@ -667,6 +704,10 @@ fn verify_sup_bytes(data: &[u8]) -> Value {
         "palette_updates": pal_updates,
         "pu_cobj_changed": pu_cobj_changed,
         "pu_pds_version_bad": pu_ver_bad,
+        "multi_obj_ds": multi_obj_ds,
+        "max_cobjs": max_cobjs,
+        "cobj_dup": dup_cobj,
+        "cobj_too_many": too_many_cobj,
     });
 
     let mut lines: Vec<Value> = Vec::new();

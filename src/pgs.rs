@@ -32,6 +32,10 @@ const MAX_GAP_TICKS: u32 = 180_000;
 const FADE_MAX_SEQ_BYTES: usize = 32 * 1024 * 1024;
 /// 一条调色板动画链最多纳入的帧数
 const FADE_MAX_FRAMES: usize = 512;
+/// 一条帧间对象拆分链最多纳入的帧数（防止超长动画吃光 object_id 预算）
+const SPLIT_MAX_FRAMES: usize = 128;
+/// 只有预估净收益达到这个字节数才启用拆分，避免边际优化换来额外风险
+const SPLIT_MIN_GAIN: isize = 64;
 
 const PCS: u8 = 0x16;
 const WDS: u8 = 0x17;
@@ -770,6 +774,218 @@ struct FadeChain {
     forced: bool,
 }
 
+// ---------------------------------------------------------------------------
+// 阶段三：帧间对象拆分（无损版）
+// ---------------------------------------------------------------------------
+
+/// 一条可无损拆成双对象显示的连续帧链。
+///
+/// SUPer 的 `ObjectDetector` 用 SSIM 阈值（约 0.986）判断「当前帧能否并进
+/// 累积合成图」，把连续帧合成一个 object 只传一次 ODS —— 那是有损近似。
+/// 这里做零画质损失的等价优化：把每帧按同一条线切成两个矩形对象
+/// （PGS 单显示集恰好最多 2 个 composition object），跨帧逐字节比较块内容，
+/// 只有完全相同的块才复用 object_id，只重传变化的块。
+struct SplitChain {
+    /// group 内起始下标
+    start: usize,
+    /// group 内结束下标（不含）
+    end: usize,
+    /// true = 左右切（cut 是第一块的宽），false = 上下切（cut 是第一块的高）
+    horizontal: bool,
+    cut: u32,
+    w: u32,
+    h: u32,
+    x: u32,
+    y: u32,
+    forced: bool,
+    /// 每帧：(PLTE, tRNS, 第一块 RLE, 第二块 RLE)
+    frames: Vec<(Vec<[u8; 3]>, Vec<u8>, Vec<u8>, Vec<u8>)>,
+    /// 链上唯一块总数，用于 object_id 预算核算
+    unique_parts: usize,
+    /// 链上唯一块的像素面积总和，用于 object buffer 预算核算
+    unique_area: u64,
+}
+
+/// 按一条线把索引矩阵切成两块，各自做 PGS RLE。不重新量化，PLTE 保持原样，
+/// 两块拼回去与原图逐像素一致。
+fn split_rle(p: &Png, horizontal: bool, cut: u32) -> (Vec<u8>, Vec<u8>) {
+    let w = p.w as usize;
+    let h = p.h as usize;
+    let c = cut as usize;
+    if horizontal {
+        let mut a = Vec::with_capacity(c * h);
+        let mut b = Vec::with_capacity((w - c) * h);
+        for y in 0..h {
+            let row = &p.idx[y * w..y * w + w];
+            a.extend_from_slice(&row[..c]);
+            b.extend_from_slice(&row[c..]);
+        }
+        (rle_encode(&a, c, h), rle_encode(&b, w - c, h))
+    } else {
+        let a = p.idx[..c * w].to_vec();
+        let b = p.idx[c * w..].to_vec();
+        (rle_encode(&a, w, c), rle_encode(&b, w, h - c))
+    }
+}
+
+/// PDS 是否把 0xFF 用作非透明色。PGS 规范要求 0xFF 是全透明保留项，
+/// SUPer 的 `is_compliant` 也会据此判不合规。
+fn palette_has_opaque_ff(entries: &[[u8; 5]]) -> bool {
+    entries.iter().any(|e| e[0] == 0xFF && e[4] != 0)
+}
+
+/// 精确统计一组 RLE 的唯一内容数与去重后的字节总量。
+/// 只做长度 + 逐字节比较，不引入哈希：误判「相同」会直接复用错对象导致画面错误。
+fn uniq_stats(items: &[Vec<u8>]) -> (usize, usize) {
+    let mut uniq: Vec<&[u8]> = Vec::new();
+    for x in items {
+        if !uniq.iter().any(|u| *u == x.as_slice()) {
+            uniq.push(x.as_slice());
+        }
+    }
+    (uniq.len(), uniq.iter().map(|u| u.len()).sum())
+}
+
+/// 在候选分割线里挑净收益最大的一条。
+/// 返回 `(horizontal, cut, gain_bytes, unique_parts, unique_area)`。
+fn best_split(pngs: &[Png]) -> Option<(bool, u32, isize, usize, u64)> {
+    if pngs.len() < 2 {
+        return None;
+    }
+    let w = pngs[0].w;
+    let h = pngs[0].h;
+    if w < 2 || h < 2 {
+        return None;
+    }
+    let full: Vec<Vec<u8>> = pngs
+        .iter()
+        .map(|p| rle_encode(&p.idx, p.w as usize, p.h as usize))
+        .collect();
+    let (uf, bf) = uniq_stats(&full);
+    // 每个唯一对象约 24 字节固定开销（段头 13 + ODS 首片头 11）
+    let base_cost = uf * 24 + bf;
+
+    let mut cuts: Vec<(bool, u32)> = Vec::new();
+    for &f in &[0.25_f64, 1.0 / 3.0, 0.5, 2.0 / 3.0, 0.75] {
+        let cx = ((w as f64 * f).round() as u32).clamp(1, w - 1);
+        let cy = ((h as f64 * f).round() as u32).clamp(1, h - 1);
+        if !cuts.contains(&(true, cx)) {
+            cuts.push((true, cx));
+        }
+        if !cuts.contains(&(false, cy)) {
+            cuts.push((false, cy));
+        }
+    }
+
+    let mut best: Option<(bool, u32, isize, usize, u64)> = None;
+    for (horiz, cut) in cuts {
+        let mut a_rles = Vec::with_capacity(pngs.len());
+        let mut b_rles = Vec::with_capacity(pngs.len());
+        for p in pngs {
+            let (a, b) = split_rle(p, horiz, cut);
+            a_rles.push(a);
+            b_rles.push(b);
+        }
+        let (ua, ba) = uniq_stats(&a_rles);
+        let (ub, bb) = uniq_stats(&b_rles);
+        let (aw, ah) = if horiz { (cut, h) } else { (w, cut) };
+        let (bw, bh) = if horiz { (w - cut, h) } else { (w, h - cut) };
+        let unique_area =
+            ua as u64 * aw as u64 * ah as u64 + ub as u64 * bw as u64 * bh as u64;
+        // 每帧多一个 composition object，PCS 里多 8 字节
+        let extra = pngs.len() * 8;
+        let split_cost = (ua + ub) * 24 + ba + bb + extra;
+        let gain = base_cost as isize - split_cost as isize;
+        if gain >= SPLIT_MIN_GAIN && best.as_ref().map_or(true, |b| gain > b.2) {
+            best = Some((horiz, cut, gain, ua + ub, unique_area));
+        }
+    }
+    best
+}
+
+/// 找出 epoch 内可拆分的连续帧链。与调色板动画链互斥（后者优先、更省）。
+fn find_split_chains(
+    group: &[usize],
+    bdn: &Bdn,
+    times: &[(u32, u32)],
+    dir: &Path,
+    fade: &[FadeChain],
+) -> Vec<SplitChain> {
+    let mut out = Vec::new();
+    let mut k = 0usize;
+    while k < group.len() {
+        if let Some(ch) = fade.iter().find(|c| c.start <= k && k < c.end) {
+            k = ch.end;
+            continue;
+        }
+        let ev0 = &bdn.events[group[k]];
+        if ev0.gs.len() != 1 {
+            k += 1;
+            continue;
+        }
+        let g0 = &ev0.gs[0];
+        let mut j = k + 1;
+        while j < group.len() && j - k < SPLIT_MAX_FRAMES {
+            if fade.iter().any(|c| c.start <= j && j < c.end) {
+                break;
+            }
+            let ei = group[j];
+            let ev = &bdn.events[ei];
+            if ev.gs.len() != 1 {
+                break;
+            }
+            let g = &ev.gs[0];
+            if g.w != g0.w || g.h != g0.h || g.x != g0.x || g.y != g0.y {
+                break;
+            }
+            if times[ei].0 != times[group[j - 1]].1 {
+                break;
+            }
+            j += 1;
+        }
+        if j - k >= 2 {
+            let mut pngs = Vec::with_capacity(j - k);
+            let mut ok = true;
+            for q in k..j {
+                match decode_png(&dir.join(&bdn.events[group[q]].gs[0].file)) {
+                    Ok(p) if p.w == g0.w && p.h == g0.h => pngs.push(p),
+                    _ => {
+                        ok = false;
+                        break;
+                    }
+                }
+            }
+            if ok {
+                if let Some((horiz, cut, _gain, up, ua)) = best_split(&pngs) {
+                    let mut frames = Vec::with_capacity(pngs.len());
+                    for p in &pngs {
+                        let (a, b) = split_rle(p, horiz, cut);
+                        frames.push((p.plte.clone(), p.trns.clone(), a, b));
+                    }
+                    out.push(SplitChain {
+                        start: k,
+                        end: j,
+                        horizontal: horiz,
+                        cut,
+                        w: g0.w,
+                        h: g0.h,
+                        x: g0.x,
+                        y: g0.y,
+                        forced: ev0.forced,
+                        frames,
+                        unique_parts: up,
+                        unique_area: ua,
+                    });
+                    k = j;
+                    continue;
+                }
+            }
+        }
+        k += 1;
+    }
+    out
+}
+
 struct Ds {
     pts: u32,
     state: u8,
@@ -889,8 +1105,16 @@ fn push_ods(
 
 /// 把 BDN XML + 索引 PNG 编成一条完整 PGS 流，写到 `out`。
 ///
-/// `vw`/`vh` 传 0 时自动按 XML 的 VideoFormat 推断；`fade` 打开调色板渐变优化。
-pub fn encode(xml: &Path, out: &Path, vw: u32, vh: u32, fade: bool) -> Result<Value, String> {
+/// `vw`/`vh` 传 0 时自动按 XML 的 VideoFormat 推断；`fade` 打开调色板渐变、
+/// `split` 打开帧间对象拆分（两者都默认开）。
+pub fn encode(
+    xml: &Path,
+    out: &Path,
+    vw: u32,
+    vh: u32,
+    fade: bool,
+    split: bool,
+) -> Result<Value, String> {
     let bdn = parse_bdn(xml)?;
     let (aw, ah) = video_size(&bdn.vfmt);
     let vw = if vw == 0 { aw } else { vw };
@@ -910,6 +1134,9 @@ pub fn encode(xml: &Path, out: &Path, vw: u32, vh: u32, fade: bool) -> Result<Va
     let mut n_fade_chains = 0usize;
     let mut n_fade_frames = 0usize;
     let mut n_pal_upd = 0usize;
+    let mut n_split_chains = 0usize;
+    let mut n_split_frames = 0usize;
+    let mut n_split_reused = 0usize;
 
     for (gi, group) in groups.iter().enumerate() {
         let win = bbox(group, &bdn, vw, vh);
@@ -921,6 +1148,13 @@ pub fn encode(xml: &Path, out: &Path, vw: u32, vh: u32, fade: bool) -> Result<Va
             Vec::new()
         };
         n_fade_chains += chains.len();
+        // 拆分链与渐变链互斥：渐变只换调色板、更省，优先占用这些帧。
+        let splits = if split {
+            find_split_chains(group, &bdn, &times, dir, &chains)
+        } else {
+            Vec::new()
+        };
+        n_split_chains += splits.len();
         let mut skip_until = 0usize;
         for (k, &ei) in group.iter().enumerate() {
             if k < skip_until {
@@ -1001,6 +1235,109 @@ pub fn encode(xml: &Path, out: &Path, vw: u32, vh: u32, fade: bool) -> Result<Va
                 }
                 skip_until = ch.end;
                 continue;
+            }
+
+            // ---------- 帧间对象拆分链：一张画面拆成 2 个对象，逐块复用 ----------
+            if let Some(sc) = splits.iter().find(|c| c.start == k) {
+                // 拆分会让唯一对象数与面积都增长，先按 group 预算核算，
+                // 不够就整链回退到普通单对象路径，绝不产出超 buffer 的流。
+                let group_area: u64 = group
+                    .iter()
+                    .map(|&i| {
+                        bdn.events[i]
+                            .gs
+                            .iter()
+                            .map(|g| g.w as u64 * g.h as u64)
+                            .sum::<u64>()
+                    })
+                    .sum();
+                let budget_ok = slots.len() + sc.unique_parts <= MAX_OBJ_IDS
+                    && group_area + sc.unique_area <= OBJ_BUDGET;
+                if budget_ok {
+                    let (aw, ah, bw, bh) = if sc.horizontal {
+                        (sc.cut, sc.h, sc.w - sc.cut, sc.h)
+                    } else {
+                        (sc.w, sc.cut, sc.w, sc.h - sc.cut)
+                    };
+                    let (bx, by) = if sc.horizontal {
+                        (sc.x + sc.cut, sc.y)
+                    } else {
+                        (sc.x, sc.y + sc.cut)
+                    };
+                    for (f, (plte, trns, ra, rb)) in sc.frames.iter().enumerate() {
+                        let parts: [(u32, u32, u32, u32, &Vec<u8>); 2] = [
+                            (aw, ah, sc.x, sc.y, ra),
+                            (bw, bh, bx, by, rb),
+                        ];
+                        let mut objs = Vec::new();
+                        let mut refs = Vec::new();
+                        for (pw, ph, px, py, rle) in parts {
+                            // key 含 PLTE/tRNS：只有调色板完全一致才可能复用，
+                            // 保证被复用对象的索引仍能被本帧 PDS 正确解释。
+                            let key = object_key(plte, trns, rle);
+                            let found = slots.iter().find(|s| s.key == key).map(|s| s.id);
+                            let id = match found {
+                                Some(p) => {
+                                    n_split_reused += 1;
+                                    p
+                                }
+                                None => {
+                                    let id = slots.len() as u16;
+                                    slots.push(Slot { id, ver: 0, key });
+                                    objs.push((id, 0u8, pw, ph, rle.to_vec()));
+                                    id
+                                }
+                            };
+                            refs.push((id, px, py, sc.forced));
+                        }
+                        // 链内后续帧即便定义了新 ODS 也走 Normal Case：
+                        // SUPer verifier 明确「Acquisition Point 之后不得访问此前的
+                        // 对象缓冲」（会清空 ods_filled 并报 expired memory），而我们
+                        // 正要复用链首定义好的恒定半区。Normal Case 不清空缓冲，
+                        // 且允许同集定义新对象，正好满足跨帧复用。
+                        let state = if k == 0 && f == 0 { ST_EPOCH } else { ST_NORMAL };
+                        dss.push(Ds {
+                            pts: ticks(times[group[sc.start + f]].0, bdn.fps),
+                            state,
+                            win: if state == ST_NORMAL { None } else { Some(win) },
+                            pal: Some(palette_entries(plte, trns, bt709)),
+                            objs,
+                            refs,
+                            comp_no,
+                            pal_upd: false,
+                        });
+                        comp_no = comp_no.wrapping_add(1);
+                        n_split_frames += 1;
+                    }
+                    // 链内时间首尾相接，只在链尾按 OutTC 判断是否补清屏
+                    let out_pts = ticks(times[group[sc.end - 1]].1, bdn.fps);
+                    let next_in = if sc.end < group.len() {
+                        Some(ticks(times[group[sc.end]].0, bdn.fps))
+                    } else if gi + 1 < groups.len() {
+                        Some(ticks(times[groups[gi + 1][0]].0, bdn.fps))
+                    } else {
+                        None
+                    };
+                    let need_clear = match next_in {
+                        Some(nx) => nx > out_pts,
+                        None => true,
+                    };
+                    if need_clear {
+                        dss.push(Ds {
+                            pts: out_pts,
+                            state: ST_NORMAL,
+                            win: None,
+                            pal: None,
+                            objs: Vec::new(),
+                            refs: Vec::new(),
+                            comp_no,
+                            pal_upd: false,
+                        });
+                        comp_no = comp_no.wrapping_add(1);
+                    }
+                    skip_until = sc.end;
+                    continue;
+                }
             }
 
             // ---------- 普通单事件 ----------
@@ -1177,6 +1514,14 @@ pub fn encode(xml: &Path, out: &Path, vw: u32, vh: u32, fade: bool) -> Result<Va
             pal_ver = 0;
         }
         if let Some(entries) = &d.pal {
+            // PGS 规范要求 palette entry 0xFF 是全透明保留项。SUPer verifier
+            // 会据此判不合规；输入 PNG 若把 0xFF 当可见色，宁可报错也不产出坏流。
+            if palette_has_opaque_ff(entries) {
+                return Err(format!(
+                    "显示集 #{} 的 PDS 把 0xFF 用作非透明色；PGS 要求 0xFF 为全透明保留项（输入 PNG 颜色数应 ≤255）",
+                    n_pcs
+                ));
+            }
             let mut q = Vec::with_capacity(2 + entries.len() * 5);
             q.push(0u8); // palette_id
             q.push(pal_ver);
@@ -1219,6 +1564,9 @@ pub fn encode(xml: &Path, out: &Path, vw: u32, vh: u32, fade: bool) -> Result<Va
         "palette_updates": n_pal_upd,
         "fade_chains": n_fade_chains,
         "fade_frames": n_fade_frames,
+        "split_chains": n_split_chains,
+        "split_frames": n_split_frames,
+        "split_objects_reused": n_split_reused,
         "video": format!("{}x{}", vw, vh),
         "fps": bdn.fps,
         "lead_ticks": lead,
@@ -1371,5 +1719,117 @@ mod tests {
         }
         assert_eq!(acc, b);
         assert!(palette_diff(&a, &a).is_empty());
+    }
+
+    fn mk_png(w: u32, h: u32, fill: impl Fn(u32, u32) -> u8) -> Png {
+        let mut idx = Vec::with_capacity((w * h) as usize);
+        for y in 0..h {
+            for x in 0..w {
+                idx.push(fill(x, y));
+            }
+        }
+        Png {
+            w,
+            h,
+            plte: vec![[0, 0, 0], [255, 255, 255], [200, 30, 40], [30, 200, 90]],
+            trns: vec![0, 255, 255, 255],
+            idx,
+        }
+    }
+
+    #[test]
+    fn split_rle_lossless() {
+        let p = mk_png(40, 12, |x, y| {
+            if (x / 3 + y / 2) % 4 == 0 {
+                1
+            } else if x < 20 && y > 8 {
+                2
+            } else if x >= 20 && y < 3 {
+                3
+            } else {
+                0
+            }
+        });
+        for (horiz, cut) in [(true, 13u32), (true, 20), (false, 4), (false, 7)] {
+            let (a, b) = split_rle(&p, horiz, cut);
+            let w = p.w as usize;
+            let h = p.h as usize;
+            let c = cut as usize;
+            let (aw, ah, bw, bh) = if horiz {
+                (c, h, w - c, h)
+            } else {
+                (w, c, w, h - c)
+            };
+            let da = rle_decode(&a, aw, ah);
+            let db = rle_decode(&b, bw, bh);
+            let mut back = vec![0u8; w * h];
+            if horiz {
+                for y in 0..h {
+                    back[y * w..y * w + c].copy_from_slice(&da[y * c..y * c + c]);
+                    back[y * w + c..y * w + w]
+                        .copy_from_slice(&db[y * (w - c)..y * (w - c) + w - c]);
+                }
+            } else {
+                back[..c * w].copy_from_slice(&da);
+                back[c * w..].copy_from_slice(&db);
+            }
+            assert_eq!(back, p.idx, "horiz={} cut={}", horiz, cut);
+        }
+    }
+
+    #[test]
+    fn split_chain_picks_stable_half() {
+        // 8 帧：左半完全恒定，右半一根逐帧右移的竖条 → 整帧帧帧不同，
+        // 现有「整帧复用」帮不上忙，但水平中线能把恒定半区单独摘出来复用。
+        let pngs: Vec<Png> = (0..8u32)
+            .map(|t| {
+                let bar = (t * 4) % 32;
+                mk_png(64, 24, |x, _y| {
+                    if x < 32 {
+                        1
+                    } else if x >= 32 + bar && x < 36 + bar {
+                        2
+                    } else {
+                        3
+                    }
+                })
+            })
+            .collect();
+        let (horiz, cut, gain, _up, _area) =
+            best_split(&pngs).expect("局部变化应存在正收益的分割线");
+        assert!(horiz, "应选左右切");
+        assert_eq!(cut, 32);
+        assert!(gain > 0);
+        let mut a_rles = Vec::new();
+        for p in &pngs {
+            a_rles.push(split_rle(p, horiz, cut).0);
+        }
+        assert_eq!(uniq_stats(&a_rles).0, 1, "恒定半区应只剩 1 个唯一块");
+    }
+
+    #[test]
+    fn split_chain_no_gain_falls_back() {
+        // 两帧整幅都在变，任何分割线都无净收益 → 不拆分
+        let pngs: Vec<Png> = (0..2u32)
+            .map(|t| mk_png(32, 12, |x, y| ((x + y + t * 5) % 4) as u8))
+            .collect();
+        assert!(best_split(&pngs).is_none(), "整幅都变时不应拆分");
+    }
+
+    #[test]
+    fn uniq_stats_is_exact() {
+        let items = vec![vec![1u8, 2, 3], vec![1, 2, 3], vec![1, 2, 4], vec![9u8]];
+        let (n, bytes) = uniq_stats(&items);
+        assert_eq!(n, 3);
+        assert_eq!(bytes, 3 + 3 + 1);
+    }
+
+    #[test]
+    fn palette_ff_must_be_transparent() {
+        // 正常 ≤255 色、0xFF 全透明、0xFF 缺失，都应放行
+        assert!(!palette_has_opaque_ff(&[[0u8, 16, 128, 128, 0], [254, 200, 100, 90, 255]]));
+        assert!(!palette_has_opaque_ff(&[[255u8, 0, 128, 128, 0]]));
+        // 0xFF 被当成可见色 → 必须拦下
+        assert!(palette_has_opaque_ff(&[[255u8, 200, 100, 90, 255]]));
     }
 }
