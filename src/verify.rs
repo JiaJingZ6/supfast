@@ -1,0 +1,510 @@
+//! HDMV PGS / SUP 合规自检 —— 只读体检，不改流、不引入任何新依赖
+//!
+//! 依据 HDMV PGS 解码器模型（见 cubicibo/SUPer 的 `doc/codec.md`）：
+//!   * 段头 13 字节：`PG`(2) + PTS(4) + DTS(4) + type(1) + size(2)，90 kHz 时钟
+//!   * RX（coded data）缓冲 1 MiB：同一 DTS 取走的段字节总和不得超
+//!   * object buffer 4 MiB：一个 epoch 内唯一 object_id 的位图面积总和不得超，且最多 64 个
+//!   * 图形解码器 Rd = 16e6 px/s、composition 控制器 Rc = 32e6 px/s
+//!   * DTS 严格单调且 < PTS；`PTS - 90000 < DTS`（PTS 最多超前 1 秒）
+//!   * PCS 的 composition_state 高两位：0x80 Epoch Start / 0x40 Acquisition / 0x00 Normal
+//!
+//! 为什么要有这个：supfast 的 `.sup` 是把每段 avs2bdnxml 的输出重映射 PTS 后拼起来的，
+//! 拼缝处的 PTS 单调性、epoch 完整性、缓冲占用从来没验证过。播放器能放 ≠ 合规。
+//!
+//! 注意两个工具链惯例，检查时不能误伤：
+//!   1. PDS / END 段的 DTS 写 0 表示「不适用」，要排除在 DTS 相关检查之外；
+//!   2. avs2bdnxml 把 PDS 的 PTS 写成接近 2^32 的哨兵值，不代表时间。
+//! 另外 ODS 首片布局是 `id(2) ver(1) flags(1) len(3) w(2) h(2)`（宽高在 [7..11]），
+//! 与部分文档写的 4 字节 len 不同，按实际流解析。
+
+use serde_json::{json, Value};
+use std::collections::{BTreeMap, HashMap};
+use std::fs;
+use std::path::Path;
+
+const PGS_HZ: f64 = 90000.0;
+
+const PCS: u8 = 0x16;
+const WDS: u8 = 0x17;
+const PDS: u8 = 0x14;
+const ODS: u8 = 0x15;
+const END: u8 = 0x80;
+
+/// RX / coded data buffer，1 MiB
+const RX_BUFFER: u64 = 1 << 20;
+/// object buffer，4 MiB
+const OBJ_BUFFER: u64 = 4 << 20;
+/// 一个 epoch 内最多 64 个唯一 object_id
+const MAX_OBJECTS: usize = 64;
+/// RLE 位图解码 16e6 px/s，窗口合成 32e6 px/s
+const RD: f64 = 16e6;
+const RC: f64 = 32e6;
+/// 日志里最多逐条列几条，剩下的聚合成一行
+const MAX_LINE_ISSUES: usize = 5;
+
+struct Issue {
+    level: &'static str,
+    code: &'static str,
+    msg: String,
+}
+
+fn add(v: &mut Vec<Issue>, level: &'static str, code: &'static str, msg: impl Into<String>) {
+    v.push(Issue { level, code, msg: msg.into() });
+}
+
+fn seg_name(t: u8) -> &'static str {
+    match t {
+        PCS => "PCS", WDS => "WDS", PDS => "PDS", ODS => "ODS", END => "END", _ => "未知段",
+    }
+}
+
+/// 90 kHz tick → HH:MM:SS.mmm
+fn clock(t: u32) -> String {
+    let s = t as f64 / PGS_HZ;
+    format!("{:02}:{:02}:{:06.3}", (s / 3600.0) as u32, (s / 60.0) as u32 % 60, s % 60.0)
+}
+
+fn kb(n: u64) -> String {
+    if n >= 1 << 20 {
+        format!("{:.2} MiB", n as f64 / (1 << 20) as f64)
+    } else {
+        format!("{:.1} KB", n as f64 / 1024.0)
+    }
+}
+
+/// ODS 首片里的 object_id 与位图面积；非首片或解析不出来返回 None
+fn ods_area(p: &[u8]) -> Option<(u16, u64)> {
+    if p.len() < 11 || p[3] & 0x80 == 0 {
+        return None;
+    }
+    let w = u16::from_be_bytes([p[7], p[8]]) as u64;
+    let h = u16::from_be_bytes([p[9], p[10]]) as u64;
+    if w == 0 || h == 0 || w > 8192 || h > 8192 {
+        return None;
+    }
+    Some((u16::from_be_bytes([p[0], p[1]]), w * h))
+}
+
+/// WDS：num_windows(1) + 每窗 id(1) x(2) y(2) w(2) h(2)
+fn wds_area(p: &[u8]) -> u64 {
+    if p.is_empty() {
+        return 0;
+    }
+    let n = (p[0] as usize).min(2);
+    let mut a = 0u64;
+    for k in 0..n {
+        let o = 1 + k * 9;
+        if o + 9 > p.len() {
+            break;
+        }
+        let w = u16::from_be_bytes([p[o + 5], p[o + 6]]) as u64;
+        let h = u16::from_be_bytes([p[o + 7], p[o + 8]]) as u64;
+        a += w * h;
+    }
+    a
+}
+
+struct Seg<'a> {
+    typ: u8,
+    pts: u32,
+    dts: u32,
+    bytes: usize,
+    payload: &'a [u8],
+    off: usize,
+}
+
+struct Ds {
+    pts: u32,
+    dts: u32,
+    state: u8,
+    bytes: u64,
+    has_end: bool,
+    window_area: u64,
+    objs: Vec<(u16, u64)>,
+    wds: Vec<u8>,
+    off: usize,
+}
+
+/// 读磁盘上的 `.sup` 并体检。读文件失败才返回 Err；流本身有问题一律写进报告。
+pub fn verify_sup_file(path: &Path) -> Result<Value, String> {
+    let data = fs::read(path).map_err(|e| format!("读 SUP 失败: {}", e))?;
+    Ok(verify_sup_bytes(&data))
+}
+
+/// 只在转换收尾跑一次，整片读入换零 seek 复杂度；42 MB 的 SUP 也就一次峰值内存。
+fn verify_sup_bytes(data: &[u8]) -> Value {
+    let mut issues: Vec<Issue> = Vec::new();
+    let mut segs: Vec<Seg> = Vec::new();
+    let mut garbage = 0usize;
+    let mut i = 0usize;
+
+    // ---------- 1. 拆段 + 段级结构 ----------
+    while i + 13 <= data.len() {
+        if &data[i..i + 2] != b"PG" {
+            i += 1;
+            garbage += 1;
+            continue;
+        }
+        let rd32 = |o: usize| u32::from_be_bytes([data[o], data[o + 1], data[o + 2], data[o + 3]]);
+        let pts = rd32(i + 2);
+        let dts = rd32(i + 6);
+        let typ = data[i + 10];
+        let sz = ((data[i + 11] as usize) << 8) | data[i + 12] as usize;
+        let end = i + 13 + sz;
+        if end > data.len() {
+            add(&mut issues, "error", "TRUNCATED", format!(
+                "偏移 {} 的 {} 段声明 {} 字节负载，文件只剩 {} 字节",
+                i, seg_name(typ), sz, data.len() - i - 13
+            ));
+            break;
+        }
+        let payload = &data[i + 13..end];
+        match typ {
+            PCS if payload.len() < 11 => add(&mut issues, "error", "SHORT_PCS",
+                format!("偏移 {} 的 PCS 只有 {} 字节（至少 11）", i, payload.len())),
+            WDS => {
+                let need = 1 + 9 * payload.first().copied().unwrap_or(0) as usize;
+                if payload.len() < need {
+                    add(&mut issues, "error", "SHORT_WDS", format!(
+                        "偏移 {} 的 WDS 声明 {} 个窗口却只有 {} 字节", i, payload.first().copied().unwrap_or(0), payload.len()
+                    ));
+                }
+            }
+            PDS if payload.len() < 2 => add(&mut issues, "error", "SHORT_PDS",
+                format!("偏移 {} 的 PDS 只有 {} 字节", i, payload.len())),
+            ODS if payload.len() < 7 => add(&mut issues, "error", "SHORT_ODS",
+                format!("偏移 {} 的 ODS 只有 {} 字节", i, payload.len())),
+            PCS | PDS | ODS | END => {}
+            _ => add(&mut issues, "error", "UNKNOWN_SEG",
+                format!("偏移 {} 出现未知段类型 0x{:02X}", i, typ)),
+        }
+        segs.push(Seg { typ, pts, dts, bytes: 13 + sz, payload, off: i });
+        i = end;
+    }
+
+    let tail = data.len() - i;
+    if tail >= 2 && data[i..].starts_with(b"PG") {
+        add(&mut issues, "error", "SHORT_HEADER",
+            format!("文件尾部 {} 字节不够一个 13 字节段头", tail));
+    } else if tail > 0 {
+        garbage += tail;
+    }
+    if garbage > 0 {
+        add(&mut issues, "error", "NOT_ALIGNED",
+            format!("{} 字节落在 'PG' 段边界之外（文件可能被拼接或截断过）", garbage));
+    }
+    if segs.is_empty() {
+        add(&mut issues, "error", "EMPTY", "文件里没有任何 PGS 段");
+    }
+
+    // ---------- 2. 显示集 / epoch 划分 ----------
+    let mut dss: Vec<Ds> = Vec::new();
+    let mut cur: Option<Ds> = None;
+    let mut orphan = 0usize;
+    let mut no_end = 0usize;
+    for s in &segs {
+        match s.typ {
+            PCS => {
+                if let Some(d) = cur.take() {
+                    if !d.has_end { no_end += 1; }
+                    dss.push(d);
+                }
+                let state = s.payload.get(7).copied().unwrap_or(0xC0) & 0xC0;
+                cur = Some(Ds {
+                    pts: s.pts, dts: s.dts, state, bytes: s.bytes as u64,
+                    has_end: false, window_area: 0, objs: Vec::new(),
+                    wds: Vec::new(), off: s.off,
+                });
+            }
+            END => {
+                if let Some(mut d) = cur.take() {
+                    d.has_end = true;
+                    d.bytes += s.bytes as u64;
+                    dss.push(d);
+                } else {
+                    orphan += 1;
+                }
+            }
+            _ => {
+                if let Some(d) = cur.as_mut() {
+                    d.bytes += s.bytes as u64;
+                    match s.typ {
+                        WDS => {
+                            d.window_area = d.window_area.max(wds_area(s.payload));
+                            if d.wds.is_empty() { d.wds = s.payload.to_vec(); }
+                        }
+                        ODS => {
+                            if let Some(pair) = ods_area(s.payload) { d.objs.push(pair); }
+                        }
+                        _ => {}
+                    }
+                } else {
+                    orphan += 1;
+                }
+            }
+        }
+    }
+    if let Some(d) = cur.take() {
+        if !d.has_end { no_end += 1; }
+        dss.push(d);
+    }
+    if orphan > 0 {
+        add(&mut issues, "error", "ORPHAN_SEG",
+            format!("{} 个段不属于任何显示集（出现在 PCS 之前或 END 之后）", orphan));
+    }
+    if no_end > 0 {
+        add(&mut issues, "error", "DS_NO_END",
+            format!("{} 组显示集缺少 END 段，解码器不会提交这次画面更新", no_end));
+    }
+    if let Some(d0) = dss.first() {
+        if d0.state != 0x80 {
+            add(&mut issues, "warn", "NO_EPOCH_START",
+                "第一条显示集不是 Epoch Start(0x80)，解码器无法从流开头独立起播");
+        }
+    }
+    let bad_state = dss.iter().filter(|d| d.state == 0xC0).count();
+    if bad_state > 0 {
+        add(&mut issues, "warn", "BAD_STATE",
+            format!("{} 组显示集的 composition_state 是保留值 0xC0", bad_state));
+    }
+
+    // ---------- 3. 缓冲：RX 按 DTS 分组、object 按 epoch 分组 ----------
+    let mut by_dts: BTreeMap<u32, u64> = BTreeMap::new();
+    for d in &dss {
+        *by_dts.entry(d.dts).or_insert(0) += d.bytes;
+    }
+    let rx_peak = by_dts.values().copied().max().unwrap_or(0);
+    let rx_over = by_dts.values().filter(|&&v| v > RX_BUFFER).count();
+    if rx_over > 0 {
+        add(&mut issues, "error", "RX_OVERFLOW",
+            format!("{} 个 DTS 上要取走的段超过 RX 缓冲 1 MiB（峰值 {}）", rx_over, kb(rx_peak)));
+    }
+
+    let mut epoch_map: HashMap<u16, u64> = HashMap::new();
+    let mut obj_peak = 0u64;
+    let mut obj_over = 0usize;
+    let mut obj_cnt_over = 0usize;
+    let mut max_obj_ids = 0usize;
+    let mut epochs = 0usize;
+    let mut wds_changed = 0usize;
+    let mut ref_wds: Vec<u8> = Vec::new();
+    let settle = |m: &HashMap<u16, u64>, peak: &mut u64, over: &mut usize, cnt: &mut usize, ids: &mut usize| {
+        let sum: u64 = m.values().sum();
+        *peak = (*peak).max(sum);
+        *ids = (*ids).max(m.len());
+        if sum > OBJ_BUFFER { *over += 1; }
+        if m.len() > MAX_OBJECTS { *cnt += 1; }
+    };
+    for d in &dss {
+        if d.state == 0x80 {
+            settle(&epoch_map, &mut obj_peak, &mut obj_over, &mut obj_cnt_over, &mut max_obj_ids);
+            epoch_map.clear();
+            ref_wds.clear();
+            epochs += 1;
+        }
+        for (id, a) in &d.objs {
+            epoch_map.insert(*id, *a);
+        }
+        if !d.wds.is_empty() {
+            if ref_wds.is_empty() {
+                ref_wds = d.wds.clone();
+            } else if ref_wds != d.wds {
+                wds_changed += 1;
+            }
+        }
+    }
+    settle(&epoch_map, &mut obj_peak, &mut obj_over, &mut obj_cnt_over, &mut max_obj_ids);
+    if obj_over > 0 {
+        add(&mut issues, "error", "OBJ_OVERFLOW",
+            format!("{} 个 epoch 的对象面积超过 object buffer 4 MiB（峰值 {}）", obj_over, kb(obj_peak)));
+    }
+    if obj_cnt_over > 0 {
+        add(&mut issues, "error", "OBJ_COUNT",
+            format!("{} 个 epoch 的唯一 object_id 超过 64（最多 {} 个）", obj_cnt_over, max_obj_ids));
+    }
+    if wds_changed > 0 {
+        add(&mut issues, "warn", "WDS_CHANGED",
+            format!("{} 处 WDS 在同一 epoch 内发生变化（规范要求 epoch 内窗口定义不变）", wds_changed));
+    }
+
+    // ---------- 4. 时序 ----------
+    // DTS==0 是 PDS/END 的「不适用」，必须排除，否则整片误报
+    let mut eq_pts_dts = 0usize;
+    let mut dts_gt_pts = 0usize;
+    let mut lead_over_1s = 0usize;
+    let mut dts_back = 0usize;
+    let mut dts_total = 0usize;
+    let mut last_dts: Option<u32> = None;
+    for s in &segs {
+        if s.dts == 0 { continue; }
+        dts_total += 1;
+        if s.dts > s.pts { dts_gt_pts += 1; }
+        if s.dts == s.pts { eq_pts_dts += 1; }
+        if s.pts.saturating_sub(s.dts) > 90000 { lead_over_1s += 1; }
+        if let Some(p) = last_dts {
+            if s.dts < p { dts_back += 1; }
+        }
+        last_dts = Some(s.dts);
+    }
+    if dts_gt_pts > 0 {
+        add(&mut issues, "error", "DTS_GT_PTS",
+            format!("{} 个段的 DTS 晚于 PTS，解码器必然来不及", dts_gt_pts));
+    }
+    if lead_over_1s > 0 {
+        add(&mut issues, "warn", "PTS_LEAD_1S",
+            format!("{} 个段的 PTS 比 DTS 超前超过 1 秒（PTS−90000 < DTS）", lead_over_1s));
+    }
+    if eq_pts_dts > 0 {
+        add(&mut issues, "warn", "PTS_EQ_DTS", format!(
+            "{}/{} 个有效 DTS 段 PTS==DTS（ITU H.222 要求 DTS<PTS；avs2bdnxml 拼接流常见，多数播放器容忍）",
+            eq_pts_dts, dts_total
+        ));
+    }
+    if dts_back > 0 {
+        add(&mut issues, "warn", "DTS_NOT_MONO",
+            format!("{} 处 DTS 小于前一段（PGS 要求 DTS 严格单调；ODS 提前解码时常见）", dts_back));
+    }
+
+    let mut pts_back: Vec<(usize, u32, u32)> = Vec::new();
+    let mut pts_dup = 0usize;
+    for w in dss.windows(2) {
+        let (a, b) = (&w[0], &w[1]);
+        if b.pts < a.pts {
+            pts_back.push((b.off, a.pts, b.pts));
+        } else if b.pts == a.pts {
+            pts_dup += 1;
+        }
+    }
+    for (off, a, b) in pts_back.iter().take(MAX_LINE_ISSUES) {
+        add(&mut issues, "error", "PTS_BACK", format!(
+            "偏移 {} 的显示集 PTS 从 {} 倒退到 {}（差 {} tick）", off, clock(*a), clock(*b), *b as i64 - *a as i64
+        ));
+    }
+    if pts_back.len() > MAX_LINE_ISSUES {
+        add(&mut issues, "error", "PTS_BACK",
+            format!("另有 {} 处显示集 PTS 倒退", pts_back.len() - MAX_LINE_ISSUES));
+    }
+    if pts_dup > 0 {
+        add(&mut issues, "warn", "PTS_DUP",
+            format!("{} 组相邻显示集共用同一个 PTS，解码器需要在同一帧处理两次更新", pts_dup));
+    }
+
+    // ---------- 5. 解码余量（Rd / Rc 的保守估算） ----------
+    let first_pcs = segs.iter().find(|s| s.typ == PCS && s.payload.len() >= 5);
+    let (vw, vh) = first_pcs
+        .map(|s| (u16::from_be_bytes([s.payload[0], s.payload[1]]), u16::from_be_bytes([s.payload[2], s.payload[3]])))
+        .unwrap_or((0, 0));
+    let plane_area = vw as u64 * vh as u64;
+    let clear_ticks = (PGS_HZ * plane_area as f64 / RC).ceil() as u64; // W_d，仅 epoch start 需要
+    let mut tight = 0usize;
+    let mut worst_need = 0u64;
+    for d in &dss {
+        let decode: u64 = d.objs.iter()
+            .map(|(_, a)| (PGS_HZ * *a as f64 / RD).ceil() as u64)
+            .sum();
+        let compose = (PGS_HZ * d.window_area as f64 / RC).ceil() as u64;
+        let clear = if d.state == 0x80 { clear_ticks } else { 0 };
+        let need = clear.max(decode) + compose;
+        let lead = d.pts.saturating_sub(d.dts) as u64;
+        if lead < need {
+            tight += 1;
+            worst_need = worst_need.max(need);
+        }
+    }
+    if tight > 0 {
+        add(&mut issues, "warn", "TIGHT_DECODE", format!(
+            "{} 组显示集的 PTS−DTS 间隔小于按 Rd/Rc 估算的解码耗时（最长需 {} tick ≈ {:.0} ms）",
+            tight, worst_need, worst_need as f64 / 90.0
+        ));
+    }
+
+    // ---------- 6. 汇总 ----------
+    let counts = |t: u8| segs.iter().filter(|s| s.typ == t).count();
+    let first_pts = dss.first().map(|d| d.pts).unwrap_or(0);
+    let last_pts = dss.last().map(|d| d.pts).unwrap_or(0);
+    let dur_ticks = last_pts.saturating_sub(first_pts);
+    let dur_s = dur_ticks as f64 / PGS_HZ;
+    let mbps = if dur_s > 0.0 { data.len() as f64 * 8.0 / dur_s / 1e6 } else { 0.0 };
+
+    let errs: Vec<&Issue> = issues.iter().filter(|x| x.level == "error").collect();
+    let warns: Vec<&Issue> = issues.iter().filter(|x| x.level == "warn").collect();
+    let ok = errs.is_empty();
+    let compliant = issues.is_empty();
+
+    let stats = json!({
+        "bytes": data.len(),
+        "segments": segs.len(),
+        "display_sets": dss.len(),
+        "epochs": epochs,
+        "pcs": counts(PCS), "wds": counts(WDS), "pds": counts(PDS),
+        "ods": counts(ODS), "end": counts(END),
+        "video": format!("{}x{}", vw, vh),
+        "duration_s": (dur_s * 1000.0).round() / 1000.0,
+        "avg_mbps": (mbps * 100.0).round() / 100.0,
+        "rx_peak": rx_peak,
+        "rx_limit": RX_BUFFER,
+        "obj_peak": obj_peak,
+        "obj_limit": OBJ_BUFFER,
+        "max_obj_ids": max_obj_ids,
+        "pts_back": pts_back.len(),
+        "pts_eq_dts": eq_pts_dts,
+        "dts_back": dts_back,
+        "tight_ds": tight,
+    });
+
+    let mut lines: Vec<Value> = Vec::new();
+    let put = |v: &mut Vec<Value>, kind: &str, line: String| {
+        v.push(json!({ "kind": kind, "line": line }));
+    };
+    put(&mut lines, "cmd", format!(
+        "SUP 合规自检 · {} 段 / {} 组显示集 / {} 个 epoch / {} · {}",
+        segs.len(), dss.len(), epochs, clock(dur_ticks), kb(data.len() as u64)
+    ));
+    put(&mut lines, "dim", format!(
+        "结构  PCS {} · WDS {} · PDS {} · ODS {} · END {}   |   画面 {}×{}   |   平均 {:.2} Mbps",
+        counts(PCS), counts(WDS), counts(PDS), counts(ODS), counts(END), vw, vh, mbps
+    ));
+    put(&mut lines, "dim", format!(
+        "缓冲  RX 峰值 {} / {} · object 峰值 {} / {} · 单 epoch 最多 {} 个对象",
+        kb(rx_peak), kb(RX_BUFFER), kb(obj_peak), kb(OBJ_BUFFER), max_obj_ids
+    ));
+    put(&mut lines, "dim", format!(
+        "时序  PCS PTS {} · DTS {} · PTS==DTS {} 段 · 解码余量不足 {} 组",
+        if pts_back.is_empty() { "递增 OK" } else { "有倒退" },
+        if dts_back == 0 { "严格单调 OK" } else { "有回退" },
+        eq_pts_dts, tight
+    ));
+    for x in errs.iter().take(MAX_LINE_ISSUES) {
+        put(&mut lines, "err", format!("✗ [{}] {}", x.code, x.msg));
+    }
+    if errs.len() > MAX_LINE_ISSUES {
+        put(&mut lines, "err", format!("… 另有 {} 处错误", errs.len() - MAX_LINE_ISSUES));
+    }
+    for x in warns.iter().take(MAX_LINE_ISSUES) {
+        put(&mut lines, "warn", format!("! [{}] {}", x.code, x.msg));
+    }
+    if warns.len() > MAX_LINE_ISSUES {
+        put(&mut lines, "warn", format!("… 另有 {} 项警告", warns.len() - MAX_LINE_ISSUES));
+    }
+    if ok {
+        put(&mut lines, if warns.is_empty() { "done" } else { "warn" }, format!(
+            "✓ 自检通过 · 无错误 · {} 项警告{}",
+            warns.len(),
+            if compliant { " · 严格合规" } else { " · 严格合规：否" }
+        ));
+    } else {
+        put(&mut lines, "err", format!(
+            "✗ 自检未通过 · {} 处错误 / {} 项警告（产物已生成，建议修复后再 mux）",
+            errs.len(), warns.len()
+        ));
+    }
+
+    json!({
+        "ok": ok,
+        "compliant": compliant,
+        "errors": errs.iter().map(|x| json!({"code": x.code, "msg": x.msg})).collect::<Vec<_>>(),
+        "warnings": warns.iter().map(|x| json!({"code": x.code, "msg": x.msg})).collect::<Vec<_>>(),
+        "stats": stats,
+        "lines": lines,
+    })
+}

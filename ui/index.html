@@ -49,6 +49,7 @@
 
   --ok:#187a5c;
   --err:#b02a1d;
+  --warn:#9a6700;
 
   --drag:rgba(255,255,255,.86);
   --sh:0 1px 2px rgba(17,22,26,.04), 0 12px 28px -22px rgba(17,22,26,.35);
@@ -91,6 +92,7 @@
 
   --ok:#3fbc8f;
   --err:#f0796c;
+  --warn:#e3b341;
 
   --drag:rgba(14,16,17,.86);
   --sh:0 1px 2px rgba(0,0,0,.5);
@@ -417,6 +419,7 @@ pre.log{
 pre.log .l-cmd{color:var(--accent-ink)}
 pre.log .l-err{color:var(--err)}
 pre.log .l-done{color:var(--ok)}
+pre.log .l-warn{color:var(--warn)}
 pre.log .l-dim{color:var(--ink-3)}
 pre.log .ph{color:var(--ink-4)}
 
@@ -811,6 +814,7 @@ body.dragging::after{
         <button class="btn primary" id="btnRun2" disabled><svg class="ic"><use href="#i-play"/></svg>开始转换</button>
         <button class="btn" id="btnCancel" disabled>取消</button>
         <button class="btn" id="btnOpenOut" disabled><svg class="ic"><use href="#i-open"/></svg>打开输出目录</button>
+        <button class="btn" id="btnVerifySup" title="检查任意 .sup 文件是否合规">检查 SUP</button>
       </div>
 
       <div class="console-head">
@@ -1053,6 +1057,28 @@ async function pickDir(start){
   } catch (e) {
     toast('打开对话框失败：' + e, 'err');
     return '';
+  } finally { S.picking = false; }
+}
+
+/* 单独体检一个已有的 .sup：转换收尾会自动跑一次，这个入口用来查别人给的流 */
+async function pickSup(){
+  if (S.picking) return;
+  S.picking = true;
+  try {
+    const picked = await T.dialog.open({
+      multiple: false, directory: false,
+      defaultPath: (S.history[0] && S.history[0].outdir) || S.ass || undefined,
+      filters: [{ name: 'PGS 字幕', extensions: ['sup'] }],
+    });
+    const p = picked ? (typeof picked === 'string' ? picked : picked[0]) : '';
+    if (!p) return;
+    showPane('log');
+    const r = await rpc('/api/verify', {sup:p});
+    if (r.error){ toast('SUP 自检失败：' + r.error, 'err'); return; }
+    if (r.lines && r.lines.length) pushLog(r.lines);
+    toast(r.ok ? 'SUP 自检完成（见日志）' : 'SUP 自检发现问题（见日志）', r.ok ? 'ok' : 'err');
+  } catch (e) {
+    toast('SUP 自检失败：' + e, 'err');
   } finally { S.picking = false; }
 }
 
@@ -1390,6 +1416,8 @@ const winAct = (fn) => () => Promise.resolve(fn(appWindow))
 $('#dotClose').onclick = winAct(w => w.close());
 $('#dotMin').onclick = winAct(w => w.minimize());
 $('#dotMax').onclick = winAct(w => w.toggleMaximize());
+
+$('#btnVerifySup').onclick = pickSup;
 
 $('#btnOpenOut').onclick = () => {
   const out = (S.history[0] && S.history[0].outdir) || '';

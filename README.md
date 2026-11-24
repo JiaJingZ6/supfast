@@ -28,7 +28,7 @@
 | **切段计划** | 全片时间轴（灰＝静态段、橙＝动态段、空档＝无字幕），四个统计数字，段列表带「段条」 |
 | **历史** | 每次成功转换一行：时间 / 字幕 / PNG 数 / SUP 体积 / 耗时 / 较原版加速比 |
 | **环境** | `avs2bdnxml` / VSFilterMod / AviSynth / 内置引擎 五项自检 |
-| **日志** | 百分比 + 进度条 + 实时日志，可取消、可打开输出目录 |
+| **日志** | 百分比 + 进度条 + 实时日志，可取消、可打开输出目录，转换收尾自动做 SUP 合规自检 |
 
 - **预设**一键套用输出规格：蓝光 23.976/1080p、PAL 高清 25/1080p、DVD 25/480p、电视 29.97/1080i。
 - **高级选项**（折叠）里是分辨率覆盖、mod 目录和七个合成开关。
@@ -66,6 +66,31 @@
 同一份字幕交给 `avs2bdnxml` 原版单跑要 484 秒；逐帧比对 1839 张全部一致
 （3 个起始帧差 1 帧，原因是 ASS 时间码只有两位小数，取整会顶到下一帧）。
 
+## SUP 合规自检
+
+`.sup` 是逐段 `avs2bdnxml` 的输出重映射 PTS 后拼起来的，拼缝处从来没有验证过。
+转换收尾会**只读**体检一次，结果按行写进「日志」页；日志页的「检查 SUP」按钮也可以
+对任意已有的 `.sup` 单跑一次（不改动文件）。
+
+检查项（依据 HDMV PGS 解码器模型）：
+
+| 类别 | 检查 |
+|---|---|
+| 结构 | `PG` 段头对齐、负载长度、段类型、PCS…END 配对、首条 Epoch Start |
+| 时序 | PCS PTS 递增、DTS 严格单调且 < PTS、`PTS−DTS` ≤ 1 秒、PTS==DTS（H.222 禁止） |
+| 缓冲 | 同一 DTS 取走的段 ≤ RX buffer 1 MiB；epoch 内对象面积 ≤ object buffer 4 MiB、唯一 object_id ≤ 64 |
+| 解码余量 | 按 Rd = 16e6 px/s、Rc = 32e6 px/s 估算 `PTS−DTS` 是否够完成清屏 / 解码 / 合成 |
+
+错误（红）是会导致画面错乱或播放失败的问题；警告（黄）是严格蓝光规范不合规、
+但多数播放器能容忍的情况。`ok` 只看错误，`compliant` 要求连警告都没有。
+自检不影响转换是否成功，也不改动 `.sup`。
+
+> 实测对照：原版 `avs2bdnxml` 单跑产出的 `ref.sup` 是 0 错误 0 警告；
+> supfast 拼出来的流会报 `PTS_EQ_DTS` / `DTS_NOT_MONO` / `TIGHT_DECODE` 等警告
+> （`sup_retime` 把 PCS/WDS/ODS/END 的 PTS 与 DTS 写成同一个值），
+> 个别拼缝处还会出现一条 `PTS_BACK`。这属于当前拼接链路的已知现象，
+> 要彻底合规需要交给 SUPer 之类的 PGS 编码器重新编码。
+
 ## 命令行（不进 GUI）
 
 release 版是 windows 子系统、没有 stdout，所以结果写文件：
@@ -73,12 +98,14 @@ release 版是 windows 子系统、没有 stdout，所以结果写文件：
 ```bat
 supfast.exe --engine analyze --ass test.ass --json out.json
 supfast.exe --engine convert --ass test.ass --out out_dir --jobs 12 --json out.json
+supfast.exe --engine verify  --sup test.sup --json verify.json
 ```
 
 - `analyze` 输出 events / frames / segs / sta / dyn / work / ratio / w / h，以及 `bands`（全片时间轴）与 `timeline`。
   `warnings` 只放会影响结果的问题（ASS 的 Timer 与帧率不符、切段数超上限）；
   `notes` 是纯信息（全片静态、多少帧含动态标签），界面上记一次日志，不弹窗。
-- `convert` 输出 pngs / secs / speed / epochs / failed / sup_size。
+- `convert` 输出 pngs / secs / speed / epochs / failed / sup_size / verify（同下的自检报告）。
+- `verify` 输出 ok / compliant / errors / warnings / stats / lines；`lines` 就是日志页显示的那几行。
 
 ## 编译
 

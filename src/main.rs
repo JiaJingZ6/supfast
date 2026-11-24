@@ -5,6 +5,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod engine;
+mod verify;
 
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
@@ -267,6 +268,15 @@ fn route(sh: &Shared, route: &str, body: &Value) -> Result<Value, String> {
             Ok(r)
         }
 
+        // ---------------- 单独体检一个已有的 SUP ----------------
+        "/api/verify" => {
+            let p = body.get("sup").and_then(|a| a.as_str()).unwrap_or("");
+            if p.is_empty() || !Path::new(p).is_file() {
+                return Err("请先选择 .sup 文件".into());
+            }
+            verify::verify_sup_file(Path::new(p))
+        }
+
         // ---------------- 开跑 ----------------
         "/api/start" => {
             let opts = body.get("opts").cloned().unwrap_or_else(|| json!({}));
@@ -403,6 +413,17 @@ fn route(sh: &Shared, route: &str, body: &Value) -> Result<Value, String> {
                         if failed > 0 {
                             sh2.push_log(format!("[warn] 有 {} 段渲染失败，PNG 会缺", failed), "err");
                         }
+                        // 引擎在收尾已经跑过 SUP 合规自检，把报告按行写进日志。
+                        // 自检失败不影响「转换成功」这个结论，所以只记日志、不改 stage。
+                        if let Some(arr) = v.get("verify").and_then(|x| x.get("lines")).and_then(|x| x.as_array()) {
+                            for l in arr {
+                                let line = l.get("line").and_then(|x| x.as_str()).unwrap_or("");
+                                let kind = l.get("kind").and_then(|x| x.as_str()).unwrap_or("dim");
+                                if !line.is_empty() {
+                                    sh2.push_log(line.to_string(), kind);
+                                }
+                            }
+                        }
                         {
                             let mut j = lock(&sh2.job);
                             j.stage = "done".into();
@@ -520,6 +541,7 @@ fn emit_json(s: &str, path: &str) {
 fn cli_engine(args: &[String]) -> i32 {
     let mut mode = "analyze";
     let mut ass = String::new();
+    let mut sup = String::new();
     let mut out = String::new();
     let mut fps = 23.976_f64;
     let mut jobs = 8_u32;
@@ -529,9 +551,14 @@ fn cli_engine(args: &[String]) -> i32 {
         match args[i].as_str() {
             "analyze" => mode = "analyze",
             "convert" => mode = "convert",
+            "verify" => mode = "verify",
             "--ass" => {
                 i += 1;
                 ass = args.get(i).cloned().unwrap_or_default();
+            }
+            "--sup" => {
+                i += 1;
+                sup = args.get(i).cloned().unwrap_or_default();
             }
             "--out" => {
                 i += 1;
@@ -553,8 +580,25 @@ fn cli_engine(args: &[String]) -> i32 {
         }
         i += 1;
     }
+    if mode == "verify" {
+        if sup.is_empty() {
+            eprintln!("用法: supfast --engine verify --sup <file.sup> [--json <out.json>]");
+            return 2;
+        }
+        return match verify::verify_sup_file(Path::new(&sup)) {
+            Ok(v) => {
+                emit_json(&serde_json::to_string_pretty(&v).unwrap(), &json_out);
+                0
+            }
+            Err(e) => {
+                eprintln!("verify 失败: {}", e);
+                1
+            }
+        };
+    }
     if ass.is_empty() {
         eprintln!("用法: supfast --engine analyze|convert --ass <file.ass> [--out <dir>] [--fps 23.976] [--jobs 8]");
+        eprintln!("     supfast --engine verify --sup <file.sup> [--json <out.json>]");
         return 2;
     }
     let opts = json!({ "ass": ass, "fps": fps, "jobs": jobs, "outdir": out,

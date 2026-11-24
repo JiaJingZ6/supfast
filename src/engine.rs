@@ -1497,6 +1497,20 @@ pub fn convert(opts: &Value, emit: Emit, cancel: Arc<AtomicBool>) -> Result<Valu
         } else {
             fs::metadata(&out_sup).map(|m| m.len()).unwrap_or(0)
         };
+
+        // 拼完做一次只读合规自检。no_sup / 无 SUP 产物时给 Null，界面不显示这一节。
+        let verify = if out_sup.is_empty() {
+            Value::Null
+        } else {
+            crate::verify::verify_sup_file(Path::new(&out_sup)).unwrap_or_else(|e| {
+                json!({
+                    "ok": false, "compliant": false,
+                    "errors": [{"code": "READ_FAIL", "msg": e}],
+                    "warnings": [],
+                    "lines": [{"kind": "err", "line": format!("✗ SUP 自检无法读取：{}", e)}],
+                })
+            })
+        };
         let total_secs = t0.elapsed().as_secs_f64();
         let speed = if total_secs > 0.0 {
             ((total_frames as f64 * 0.0031 / total_secs) * 100.0).round() / 100.0
@@ -1518,6 +1532,7 @@ pub fn convert(opts: &Value, emit: Emit, cancel: Arc<AtomicBool>) -> Result<Valu
             "frames": total_frames,
             "speed": speed,
             "sup_size": sup_size,
+            "verify": verify,
             "events": ass.events.len(),
             "segs": segs.len(),
         }))
