@@ -1,6 +1,7 @@
 # supfast
 
 把 ASS / SSA 字幕按「画面是否变化」切成段，只渲染必要的帧，输出 PGS（`.sup`）与 BDN（`.xml`）。
+内置 Rust PGS 编码器可把同一份 BDN 一次性整流成严格合规的流，不需要 Python 或外部编码器。
 
 给压制组、字幕组和 DIY 蓝光用的：一条 1 小时 44 分的片子，只要 2.4% 的帧真的在动，
 剩下 97.6% 的画面是静止的 —— 静止段只需要渲染段首那一帧。
@@ -27,11 +28,12 @@
 | **转换** | 文件行（拖入 `.ass` 或从「最近」选）、帧率 / VideoFormat / 语言码 / 轨道名 / 并行度、切段计划、输出目录、高级选项 |
 | **切段计划** | 全片时间轴（灰＝静态段、橙＝动态段、空档＝无字幕），四个统计数字，段列表带「段条」 |
 | **历史** | 每次成功转换一行：时间 / 字幕 / PNG 数 / SUP 体积 / 耗时 / 较原版加速比 |
-| **环境** | `avs2bdnxml` / VSFilterMod / AviSynth / 内置引擎 / SUPer（可选）六项自检 |
-| **日志** | 百分比 + 进度条 + 实时日志，可取消、可打开输出目录，收尾自动做 SUP 合规自检；开启 SUPer 时另给两套流的自检对比 |
+| **环境** | `avs2bdnxml` / VSFilterMod / AviSynth / 内置引擎 / SUPer（可选）六项自检；Rust 原生 PGS 是内置的，不需要额外环境 |
+| **日志** | 百分比 + 进度条 + 实时日志，可取消、可打开输出目录，收尾自动做 SUP 合规自检；开启原生 PGS / SUPer 时另给多套流的自检对比 |
 
 - **预设**一键套用输出规格：蓝光 23.976/1080p、PAL 高清 25/1080p、DVD 25/480p、电视 29.97/1080i。
-- **高级选项**（折叠）里是分辨率覆盖、mod 目录、七个合成开关，以及可选的 SUPer 重编码。
+- **高级选项**（折叠）里是分辨率覆盖、mod 目录、七个合成开关，以及可选的
+  Rust 原生 PGS 整流与 SUPer 重编码。
 
 | 开关 | 传给 avs2bdnxml | 作用 |
 |---|---|---|
@@ -52,9 +54,11 @@
 
 ```
 <目录>\<字幕名>\
-├─ <字幕名>.xml      BDN 字幕（PNG 序列的时序与坐标）
-├─ <字幕名>.sup      PGS 流，可直接 mux 进 m2ts / mkv
-└─ <帧号>.png        按需渲染的图形
+├─ <字幕名>.xml           BDN 字幕（PNG 序列的时序与坐标）
+├─ <字幕名>.sup           PGS 流（默认拼段），可直接 mux 进 m2ts / mkv
+├─ <字幕名>.native.sup    Rust 原生整流 PGS（开启「Rust 原生 PGS」时）
+├─ <字幕名>.super.sup     SUPer 重编码 PGS（开启 SUPer 时）
+└─ <帧号>.png             按需渲染的图形
 ```
 
 无论填不填输出目录，产物**总是**落在 `<目录>\<字幕名>\` 这一层里：
@@ -99,10 +103,47 @@ display set buffering 提前解码，不能只看单个显示集的 `PTS−DTS`�
 > - **SUPer 重新编码的 `.super.sup`：0 错误 0 警告、严格合规** —— 用权威编码器反向
 >   验证这套规则没有误伤合规流。
 >
+> - **Rust 原生整流流 `.native.sup`：0 错误 0 警告、严格合规**，且首个 ODS 解码后
+>   与源 PNG 逐像素一致 —— `test2.ass` 上顺带把体积从 3.37 MB 压到 1.32 MB。
+>
 > 早先会报的 `PTS_EQ_DTS` / `DTS_NOT_MONO` / `TIGHT_DECODE` / `PTS_BACK` 已在
 > `sup_retime` 里修掉：同一显示集内各段共用呈现时刻，DTS = PTS − 按分辨率算出的解码
 > 提前量（全片统一，随 PTS 单调），起点落在上一段末尾之前的段整体平移一帧。
-> 要把剩下的 `WDS_CHANGED` / `PTS_DUP` 也消除，打开下面的 SUPer 后端即可。
+> 要把剩下的 `WDS_CHANGED` / `PTS_DUP` 也消除，打开下面的 Rust 原生 PGS（内置、推荐）
+> 或 SUPer 后端即可。
+
+## Rust 原生 PGS（内置 · 推荐）
+
+默认 `.sup` 是「每段一个 epoch、逐段拼接」的产物，快，但相邻段各自带完整 WDS/PCS，
+`test2.ass` 上会留 `WDS_CHANGED` / `PTS_DUP` 两个警告。想要**严格合规**又不想装 Python，
+在「高级选项 → Rust 原生 PGS」打开开关：supfast 自带的编码器把主 `.xml` + 索引 PNG
+一次性规划成一条流，额外产出 `<字幕名>.native.sup`，不覆盖默认产物、不改变 PNG。
+
+它按 HDMV PGS 规范独立实现（不是 SUPer 的移植，也不分发任何 GPL 代码）：
+
+| 环节 | 做法 |
+|---|---|
+| 输入 | 直接读 8bit 索引 PNG，用 `PLTE`/`tRNS` 生成 PDS（RGB→YCbCr，BT.709/601）；`avs2bdnxml -p 1` 已经量化好，不需要量化器 |
+| RLE | 标准 PGS 行程编码；单个对象超过 65535 字节自动切 FIRST / 中间 / LAST 分片 |
+| epoch | 按 object buffer（面积 3 MiB 预算、60 个对象上限）与 2 秒空档把事件串分组，epoch 内窗口定义固定 |
+| 对象复用 | 同一 epoch 内「位图 + 调色板」完全相同就复用 `object_id`，走 Normal Case，不重传 ODS |
+| 显示集 | 组首 Epoch Start、新位图 Acquisition Point、空档补清屏显示集；Epoch Start / Acquisition 都带同一份 WDS |
+| 时序 | 同一显示集共用 PTS 与 DTS，`DTS = PTS − 按分辨率算的解码提前量`（全片常量、随 PTS 单调）；PDS / END 的 DTS 写 0 =「不适用」 |
+
+PNG 重复度越高收益越大：`test2.ass` 的 195 张 PNG 只有 52 张唯一内容，复用 127 次，
+SUP 从 3.37 MB 降到 1.32 MB；`drama.ass` 的图几乎张张不同，体积与原流基本持平。
+
+| 样本 | 默认拼段流 | SUPer 重编码 | Rust 原生 PGS |
+|---|---|---|---|
+| `test2.ass` | 3.37 MB / 0 错 2 警 | 3.42 MB / 0 错 0 警 | **1.32 MB / 0 错 0 警** |
+| `drama.ass` | 42.27 MB / 0 错 0 警 | 43.07 MB / 0 错 0 警 | **42.18 MB / 0 错 0 警** |
+
+不需要 `avs2bdnxml` 的 SUP 输出、不需要 Python / SUPer；只多一个纯 Rust 的 `flate2`
+（解压 PNG 的 zlib 数据），无 DLL、静态链接。两套 SUP 都会在日志页各跑一次合规自检。
+
+**暂不支持**（后续阶段）：淡入淡出 / 卡拉OK 的调色板渐变、SSIM 帧间对象拆分、
+窗口布局优化。需要这些特效仍走下面的 SUPer 后端。另外，单个显示集超过 1 MiB 会直接
+报错而不是产出超 RX 缓冲的流 —— 常规字幕用不到，全屏大图需要注意。
 
 ## SUPer 高质量 PGS（可选）
 
@@ -156,25 +197,34 @@ release 版是 windows 子系统、没有 stdout，所以结果写文件：
 supfast.exe --engine analyze --ass test.ass --json out.json
 supfast.exe --engine convert --ass test.ass --out out_dir --jobs 12 --json out.json
 supfast.exe --engine verify  --sup test.sup --json verify.json
+supfast.exe --engine convert --ass test.ass --native-pgs --json out.json
 supfast.exe --engine convert --ass test.ass --super --super-cmd H://DIY//SUPer-cli//supercli.py --json out.json
+:: 对已有的 BDN XML + 同目录 PNG 单独跑原生编码器（不重渲字幕）
+supfast.exe --engine pgs --xml test2.xml --json pgs.json
+supfast.exe --engine pgs --xml test2.xml --out test2.native.sup --vw 1920 --vh 1080 --json pgs.json
 ```
 
 - `analyze` 输出 events / frames / segs / sta / dyn / work / ratio / w / h，以及 `bands`（全片时间轴）与 `timeline`。
   `warnings` 只放会影响结果的问题（ASS 的 Timer 与帧率不符、切段数超上限）；
   `notes` 是纯信息（全片静态、多少帧含动态标签），界面上记一次日志，不弹窗。
-- `convert` 输出 pngs / secs / speed / epochs / failed / sup_size / verify（自检报告）/ super（SUPer 重编码报告，未开启时为 `null`）。
+- `convert` 输出 pngs / secs / speed / epochs / failed / sup_size / verify（自检报告）/
+  super（SUPer 重编码报告）/ native（Rust 原生 PGS 报告），未开启的后端为 `null`。
 - `verify` 输出 ok / compliant / errors / warnings / stats / lines；`lines` 就是日志页显示的那几行。
+- `pgs` 输出 bytes / display_sets / epochs / pcs / wds / pds / ods / end / objects_reused /
+  lead_ticks，外加对产物的 `verify` 自检报告。`--vw`/`--vh` 省略时按 XML 的 VideoFormat 推断。
 
 ## 编译
 
 需要 Rust（`x86_64-pc-windows-gnu` 目标）、Python（生成图标）和一份 `avs2bdnxml` + `VSFilterMod` 的 `mod\` 目录。
 直接跑 `build.bat`：设 PATH → `cargo build --release` → 把 exe、`WebView2Loader.dll`、`mod\` 组装进 `dist\`。
+除 Tauri 外只多一个纯 Rust 的 `flate2`（`rust_backend` / miniz_oxide，用来解压 PNG 的 zlib 数据），
+无 C 库、无 DLL，交叉编译不受影响。
 
-发布目录 7.3 MB，绿色解压即用：
+发布目录约 7.6 MB，绿色解压即用：
 
 ```
 dist\
-├─ supfast.exe            3.8 MB
+├─ supfast.exe            4.1 MB
 ├─ WebView2Loader.dll     157 KB   gnu 目标是动态加载 WebView2，必须带
 └─ mod\                   3.4 MB   avs2bdnxml.exe + csri\VSFilterMod.dll
 ```
@@ -188,6 +238,9 @@ dist\
 ├─ capabilities\default.json   主窗口权限（core:default、dialog、窗口控制）
 ├─ icons\icon.ico              4 根竖条，最后一根是强调橙（make_icon.py 生成）
 ├─ src\engine.rs               引擎：解析 → 切段 → 并行渲染 → 重写 XML / SUP
+├─ src\pgs.rs                  原生 PGS 编码器：PNG/RLE → epoch 规划 → 段序列化
+├─ src\verify.rs               SUP 合规自检（零依赖）
+├─ src\superenc.rs             可选 SUPer 外部调用
 ├─ src\main.rs                 IPC 路由 + 状态持久化 + 命令行入口
 ├─ ui\index.html               界面（单文件 HTML + CSS + JS）
 ├─ tools\gcc_shim.rs           windres 用的最小 gcc -E 垫片（见下）
@@ -293,7 +346,8 @@ tools\winbox.exe min "Google Chrome"    :: 截图前把挡在前面的窗口最�
 
 - **没有安装包**：只产出 `exe` + `mod` 目录，绿色解压即用。
 - **SUPer 不随包分发**：可选的「高质量 PGS」后端需要自行安装 GPL-3.0 的 SUPer，
-  见 [SUPer 高质量 PGS（可选）](#super-高质量-pgs可选)。
+  见 [SUPer 高质量 PGS（可选）](#super-高质量-pgs可选)。内置的
+  [Rust 原生 PGS](#rust-原生-pgs内置--推荐) 不需要它，但没有淡入淡出 / 卡拉OK 的调色板渐变。
 - 无边框窗口用 `data-tauri-drag-region` 拖动，**双击标题栏不会最大化**，用右上角按钮。
 - 目标机器需要 WebView2 运行时（Win10 1803+ 与 Win11 自带）。
 - 右键菜单是关掉的：WebView2 默认会弹「重新加载 / 另存为 / 打印 / 检查」，

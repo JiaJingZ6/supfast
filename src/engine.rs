@@ -839,6 +839,8 @@ struct RunOpts {
     super_encode: bool,
     /// supercli.py / 启动器路径；空则由 superenc 自动探测环境变量与常见位置
     super_cmd: String,
+    /// 可选后端：用内置的 Rust 原生 PGS 编码器整流生成 <名>.native.sup（零外部依赖）
+    native_pgs: bool,
 }
 
 fn read_opts(v: &Value) -> Result<RunOpts, String> {
@@ -892,6 +894,7 @@ fn read_opts(v: &Value) -> Result<RunOpts, String> {
         dry_run: pick_flag(v, "dry_run", false),
         super_encode: pick_flag(v, "super_encode", false),
         super_cmd: pick_str(v, "super_cmd"),
+        native_pgs: pick_flag(v, "native_pgs", false),
     })
 }
 
@@ -1654,6 +1657,28 @@ pub fn convert(opts: &Value, emit: Emit, cancel: Arc<AtomicBool>) -> Result<Valu
             Value::Null
         };
 
+        // ---------- 可选后端：Rust 原生 PGS 编码器（内置、零外部依赖） ----------
+        // 同样只吃主 XML + PNG，但整条流一次性规划 epoch / 对象复用 / DTS，
+        // 不依赖 avs2bdnxml 的 SUP 输出，也不需要 Python。产物单独落 <名>.native.sup。
+        let native_report = if o.native_pgs {
+            emit(json!({"t":"stage","name":"native_pgs"}));
+            let nat = outdir.join(format!("{}.native.sup", base));
+            match crate::pgs::encode(out_xml.as_path(), &nat, w, h) {
+                Ok(mut rep) => {
+                    rep["verify"] = crate::verify::verify_sup_file(&nat).unwrap_or_else(|e| json!({
+                        "ok": false, "compliant": false,
+                        "errors": [{"code": "READ_FAIL", "msg": e}],
+                        "warnings": [],
+                        "lines": [{"kind": "err", "line": format!("✗ 原生 PGS 自检无法读取：{}", e)}],
+                    }));
+                    rep
+                }
+                Err(e) => json!({ "ok": false, "error": e }),
+            }
+        } else {
+            Value::Null
+        };
+
         Ok(json!({
             "t":"done",
             "ok": true,
@@ -1670,6 +1695,7 @@ pub fn convert(opts: &Value, emit: Emit, cancel: Arc<AtomicBool>) -> Result<Valu
             "sup_size": sup_size,
             "verify": verify,
             "super": super_report,
+            "native": native_report,
             "events": ass.events.len(),
             "segs": segs.len(),
         }))
@@ -1708,6 +1734,7 @@ pub fn probe_env(mod_root: Option<&str>, super_cmd: &str) -> Value {
         dry_run: false,
         super_encode: false,
         super_cmd: String::new(),
+        native_pgs: false,
     };
     let found = locate_exe(&o);
     let (exe_s, dll_s, dir_s) = match &found {

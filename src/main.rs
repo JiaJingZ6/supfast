@@ -7,6 +7,7 @@
 mod engine;
 mod verify;
 mod superenc;
+mod pgs;
 
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
@@ -55,7 +56,8 @@ fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 const DEFAULT_SETTINGS: &str = r#"{
   "mod_root":"","fps":"23.976","vfmt":"1080p","lang":"zho","title":"Undefined",
   "theme":"auto","jobs":8,"outdir":"",
-  "palette":1,"autocrop":1,"bufsplit":1,"stricter":0,"even_y":0,"no_sup":0,"dry_run":0
+  "palette":1,"autocrop":1,"bufsplit":1,"stricter":0,"even_y":0,"no_sup":0,"dry_run":0,
+  "super_encode":0,"native_pgs":0
 }"#;
 
 impl Shared {
@@ -500,6 +502,52 @@ fn route(sh: &Shared, route: &str, body: &Value) -> Result<Value, String> {
                                 }
                             }
                         }
+                        // 可选后端：Rust 原生 PGS 编码器结果 + 自检结论。
+                        // 与 SUPer 一样，失败只记日志、不影响「转换成功」。
+                        if let Some(n) = v.get("native").and_then(|x| x.as_object()) {
+                            let nok = n.get("ok").and_then(|x| x.as_bool()).unwrap_or(false);
+                            sh2.push_log(
+                                format!("Rust 原生 PGS · {}", if nok { "完成" } else { "未执行" }),
+                                if nok { "cmd" } else { "warn" },
+                            );
+                            if nok {
+                                sh2.push_log(
+                                    format!(
+                                        "  {} · {} · {} 显示集 / {} epoch / 复用 {} 个对象",
+                                        n.get("sup").and_then(|x| x.as_str()).unwrap_or(""),
+                                        fmt_n(n.get("bytes").and_then(|x| x.as_u64()).unwrap_or(0) as i64),
+                                        n.get("display_sets").and_then(|x| x.as_u64()).unwrap_or(0),
+                                        n.get("epochs").and_then(|x| x.as_u64()).unwrap_or(0),
+                                        n.get("objects_reused").and_then(|x| x.as_u64()).unwrap_or(0),
+                                    ),
+                                    "dim",
+                                );
+                                let empty_verify = json!({});
+                                let nv = n.get("verify").unwrap_or(&empty_verify);
+                                let ne = nv.get("errors").and_then(|x| x.as_array()).map(|a| a.len()).unwrap_or(0);
+                                let nw = nv.get("warnings").and_then(|x| x.as_array()).map(|a| a.len()).unwrap_or(0);
+                                sh2.push_log(
+                                    format!("  自检 {} 错 / {} 警", ne, nw),
+                                    if ne == 0 && nw == 0 { "done" } else { "warn" },
+                                );
+                                if let Some(arr) = nv.get("lines").and_then(|x| x.as_array()) {
+                                    for l in arr.iter().take(6) {
+                                        let line = l.get("line").and_then(|x| x.as_str()).unwrap_or("");
+                                        if !line.is_empty() {
+                                            sh2.push_log(
+                                                format!("  {}", line),
+                                                l.get("kind").and_then(|x| x.as_str()).unwrap_or("dim"),
+                                            );
+                                        }
+                                    }
+                                }
+                            } else {
+                                sh2.push_log(
+                                    format!("  {}", n.get("error").and_then(|x| x.as_str()).unwrap_or("未知原因")),
+                                    "err",
+                                );
+                            }
+                        }
                         {
                             let mut j = lock(&sh2.job);
                             j.stage = "done".into();
@@ -618,11 +666,15 @@ fn cli_engine(args: &[String]) -> i32 {
     let mut mode = "analyze";
     let mut ass = String::new();
     let mut sup = String::new();
+    let mut xml = String::new();
     let mut out = String::new();
     let mut fps = 23.976_f64;
     let mut jobs = 8_u32;
+    let mut vw = 0_u32;
+    let mut vh = 0_u32;
     let mut json_out = String::new();
     let mut super_encode = false;
+    let mut native_pgs = false;
     let mut super_cmd = String::new();
     let mut i = 0;
     while i < args.len() {
@@ -630,6 +682,7 @@ fn cli_engine(args: &[String]) -> i32 {
             "analyze" => mode = "analyze",
             "convert" => mode = "convert",
             "verify" => mode = "verify",
+            "pgs" => mode = "pgs",
             "--ass" => {
                 i += 1;
                 ass = args.get(i).cloned().unwrap_or_default();
@@ -638,9 +691,21 @@ fn cli_engine(args: &[String]) -> i32 {
                 i += 1;
                 sup = args.get(i).cloned().unwrap_or_default();
             }
+            "--xml" => {
+                i += 1;
+                xml = args.get(i).cloned().unwrap_or_default();
+            }
             "--out" => {
                 i += 1;
                 out = args.get(i).cloned().unwrap_or_default();
+            }
+            "--vw" => {
+                i += 1;
+                vw = args.get(i).and_then(|s| s.parse().ok()).unwrap_or(0);
+            }
+            "--vh" => {
+                i += 1;
+                vh = args.get(i).and_then(|s| s.parse().ok()).unwrap_or(0);
             }
             "--fps" => {
                 i += 1;
@@ -655,6 +720,7 @@ fn cli_engine(args: &[String]) -> i32 {
                 json_out = args.get(i).cloned().unwrap_or_default();
             }
             "--super" => super_encode = true,
+            "--native-pgs" => native_pgs = true,
             "--super-cmd" => {
                 i += 1;
                 super_cmd = args.get(i).cloned().unwrap_or_default();
@@ -679,14 +745,42 @@ fn cli_engine(args: &[String]) -> i32 {
             }
         };
     }
+    if mode == "pgs" {
+        if xml.is_empty() {
+            eprintln!("用法: supfast --engine pgs --xml <file.xml> [--out <file.sup>] [--vw 1920] [--vh 1080] [--json <out.json>]");
+            return 2;
+        }
+        let xp = Path::new(&xml);
+        let outp = if out.is_empty() {
+            xp.with_extension("native.sup")
+        } else {
+            PathBuf::from(&out)
+        };
+        return match pgs::encode(xp, &outp, vw, vh) {
+            Ok(mut v) => {
+                v["verify"] = verify::verify_sup_file(&outp).unwrap_or_else(|e| json!({
+                    "ok": false, "compliant": false,
+                    "errors": [{"code": "READ_FAIL", "msg": e}],
+                    "warnings": [], "lines": []
+                }));
+                emit_json(&serde_json::to_string_pretty(&v).unwrap(), &json_out);
+                0
+            }
+            Err(e) => {
+                eprintln!("原生 PGS 编码失败: {}", e);
+                1
+            }
+        };
+    }
     if ass.is_empty() {
-        eprintln!("用法: supfast --engine analyze|convert --ass <file.ass> [--out <dir>] [--fps 23.976] [--jobs 8] [--super] [--super-cmd <path>]");
+        eprintln!("用法: supfast --engine analyze|convert --ass <file.ass> [--out <dir>] [--fps 23.976] [--jobs 8] [--super] [--super-cmd <path>] [--native-pgs]");
         eprintln!("     supfast --engine verify --sup <file.sup> [--json <out.json>]");
+        eprintln!("     supfast --engine pgs --xml <file.xml> [--out <file.sup>] [--json <out.json>]");
         return 2;
     }
     let opts = json!({ "ass": ass, "fps": fps, "jobs": jobs, "outdir": out,
         "vfmt": "1080p", "lang": "chi", "title": "Undefined",
-        "super_encode": super_encode, "super_cmd": super_cmd });
+        "super_encode": super_encode, "super_cmd": super_cmd, "native_pgs": native_pgs });
     match mode {
         "analyze" => match engine::analyze(&opts) {
             Ok(v) => {
