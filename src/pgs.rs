@@ -501,7 +501,11 @@ fn mono_times(bdn: &Bdn) -> Vec<(u32, u32)> {
     v
 }
 
-fn group_epochs(bdn: &Bdn, times: &[(u32, u32)]) -> Vec<Vec<usize>> {
+/// `min_gap` 是切 epoch 所需的最小时间空档。新 epoch 的 DTS = 首个显示集
+/// PTS − lead，必须晚于上一个 epoch 的最后呈现时刻（SUPer
+/// `check_pts_dts_sanity` 的 `epoch_start_dts>prev_pts`）；连续帧处切 epoch
+/// 会让这条必然失败，所以把切分点推迟到下一个有足够空档的事件。
+fn group_epochs(bdn: &Bdn, times: &[(u32, u32)], min_gap: u32) -> Vec<Vec<usize>> {
     let mut groups: Vec<Vec<usize>> = Vec::new();
     let mut cur: Vec<usize> = Vec::new();
     let mut area = 0u64;
@@ -513,10 +517,24 @@ fn group_epochs(bdn: &Bdn, times: &[(u32, u32)]) -> Vec<Vec<usize>> {
             .map(|g| g.w as u64 * g.h as u64)
             .sum();
         let n = bdn.events[i].gs.len();
-        let long_gap = cur.last().map_or(false, |&p| {
-            ticks(times[i].0, bdn.fps).saturating_sub(ticks(times[p].1, bdn.fps)) > MAX_GAP_TICKS
+        let in_t = ticks(times[i].0, bdn.fps);
+        // empty_gap 用于「2 秒空档另起 epoch」；verifier_gap 必须与 SUPer
+        // check_pts_dts_sanity 的 prev_pts 口径一致：上一 epoch 最后一个显示集的
+        // PTS 在有空档时是清屏显示集（= prev_out），无清屏时是事件显示集（= prev_in）。
+        // 早期用 in−prev_out 会偏小，误把合法边界合并成过大的 epoch（对象超 64/4 MiB）。
+        let (empty_gap, verifier_gap) = cur.last().map_or((0u32, 0u32), |&p| {
+            let prev_in = ticks(times[p].0, bdn.fps);
+            let prev_out = ticks(times[p].1, bdn.fps);
+            let vpts = if in_t > prev_out { prev_out } else { prev_in };
+            (in_t.saturating_sub(prev_out), in_t.saturating_sub(vpts))
         });
-        if !cur.is_empty() && (area + add > OBJ_BUDGET || ids + n > MAX_OBJ_IDS || long_gap) {
+        let long_gap = empty_gap > MAX_GAP_TICKS;
+        // `first_pts − lead > prev_pts` ⟺ verifier_gap > lead（严格大于）。
+        let may_cut = cur.is_empty() || verifier_gap > min_gap;
+        if !cur.is_empty()
+            && may_cut
+            && (area + add > OBJ_BUDGET || ids + n > MAX_OBJ_IDS || long_gap)
+        {
             groups.push(std::mem::take(&mut cur));
             area = add;
             ids = n;
@@ -1123,12 +1141,20 @@ pub fn encode(
     let dir = xml.parent().unwrap_or_else(|| Path::new("."));
     let frame_ticks = (PGS_HZ / bdn.fps).round() as u32;
     let plane = vw as f64 * vh as f64;
-    // 与 engine::sup_retime 相同的保守提前量：清屏/解码/合成的最坏上界 + 一帧余量
-    let worst = (PGS_HZ * plane / RD + PGS_HZ * plane / RC).ceil() as u32;
-    let lead = (worst.saturating_add(frame_ticks + 1)).clamp(1, 89_999);
+    // 段时序按 HDMV PGS / SUPer `check_pts_dts_sanity` 的硬约束取提前量：
+    //   * Epoch Start 要求 PTS−DTS > 全屏擦除时间 wipe = plane·90k/Rc；
+    //   * WDS 要求 PTS−DTS <= 2·wipe，且所有段 PTS−DTS < 1 秒（90000 ticks）；
+    //   * 同一显示集内所有段共用一个 DTS，段序列必须全程非递减。
+    // 取 wipe + 一帧，同时落在 (wipe, 2·wipe] 内；4K 下也远小于 1 秒。
+    // 阶段一用的「清屏+解码+合成最坏上界」在 1080p 是 21251 ticks，会踩
+    // WDS 的 2·wipe=11664 红线，故不再用作 DTS 提前量（解码余量改由报告统计）。
+    let wipe = (PGS_HZ * plane / RC).ceil() as u32;
+    let lead = (wipe.saturating_add(frame_ticks + 1)).clamp(1, 89_999);
 
     let times = mono_times(&bdn);
-    let groups = group_epochs(&bdn, &times);
+    // verifier 要求 `first_pts − lead > prev_pts`，等价于切分处空档 `gap > lead`
+    // （严格大于，不是 >=），所以 min_gap 直接传 lead，不要 +1。
+    let groups = group_epochs(&bdn, &times, lead);
     let mut dss: Vec<Ds> = Vec::new();
     let mut reused = 0usize;
     let mut n_fade_chains = 0usize;
@@ -1465,6 +1491,31 @@ pub fn encode(
         }
     }
 
+    // 带 WDS 的显示集要求「与前一显示集的 PTS 间隔 > 窗口擦除时间
+    // pts_delta = 窗口面积·90k/Rc」（SUPer check_pts_dts_sanity）。逐帧连续的
+    // 大窗口素材物理上凑不出这个间隔（一帧 3753 ticks，全屏窗口擦除要 5832）。
+    // 这类 Acquisition Point 就省略 WDS，并降级为 Normal Case —— SUPer 的
+    // test_diplayset 规定「非 Normal Case 必须带 WDS」，而 Normal Case 允许沿用
+    // Epoch Start 的窗口定义、允许同集定义新对象，时序也改走「至少一帧间隔」。
+    // Epoch Start 必须保留 WDS，其前方空档已由 group_epochs 保证 > lead > pts_delta。
+    let mut n_wds_dropped = 0usize;
+    for i in 1..dss.len() {
+        if dss[i].state == ST_EPOCH {
+            continue;
+        }
+        if let Some((_x, _y, w, h)) = dss[i].win {
+            let gap = dss[i].pts.saturating_sub(dss[i - 1].pts);
+            let pts_delta = (PGS_HZ * (w as f64 * h as f64) / RC).ceil() as u32;
+            if gap <= pts_delta {
+                dss[i].win = None;
+                if dss[i].state == ST_ACQ {
+                    dss[i].state = ST_NORMAL;
+                }
+                n_wds_dropped += 1;
+            }
+        }
+    }
+
     let mut buf: Vec<u8> = Vec::new();
     let mut pal_ver = 0u8;
     let mut n_pcs = 0usize;
@@ -1474,9 +1525,15 @@ pub fn encode(
     let mut n_end = 0usize;
     for d in &dss {
         let pts = d.pts;
-        // PCS/WDS/ODS 共用解码时刻；PDS/END 的 DTS=0 =「不适用」，
-        // 与 engine::sup_retime 保持一致，也避免 PDS 的 PTS 打乱全局 DTS 单调性。
-        let dts = pts.saturating_sub(lead).max(1);
+        // 整个显示集的所有段共用一个 DTS（= base）。PDS / END 在 PGS 里
+        // 的 DTS 被解码器与 SUPer 的 PDS.__init__/END.__init__ 强制等于其 PTS，
+        // 所以它们的 PTS 也必须取 base；否则会被读成「显示集 PTS」并夹在
+        // ODS（DTS=base）之间，令全局 DTS 序列回退 —— 这正是旧实现写
+        // DTS=0 时 SUPer `check_pts_dts_sanity` 判 out of spec 的根因。
+        // 只有 PCS/WDS/ODS 的 PTS 取呈现时刻 pts，形成 ref.sup 的排布模板：
+        //   DTS: base base base base base   PTS: pts pts base pts base
+        let base = pts.saturating_sub(lead).max(1);
+        let ctl_pts = base;
         let ds_start = buf.len();
 
         let mut p = Vec::with_capacity(11 + 8 * d.refs.len());
@@ -1495,7 +1552,7 @@ pub fn encode(
             p.extend_from_slice(&(x as u16).to_be_bytes());
             p.extend_from_slice(&(y as u16).to_be_bytes());
         }
-        push_seg(&mut buf, PCS, pts, dts, &p)?;
+        push_seg(&mut buf, PCS, pts, base, &p)?;
         n_pcs += 1;
 
         // epoch 内 WDS 字节恒定：Epoch Start / Acquisition 都带，Normal 不带。
@@ -1505,7 +1562,7 @@ pub fn encode(
             q.extend_from_slice(&(y as u16).to_be_bytes());
             q.extend_from_slice(&(w as u16).to_be_bytes());
             q.extend_from_slice(&(h as u16).to_be_bytes());
-            push_seg(&mut buf, WDS, pts, dts, &q)?;
+            push_seg(&mut buf, WDS, pts, base, &q)?;
             n_wds += 1;
         }
         // Acquisition / Epoch Start 会重置解码器里的调色板状态，版本重新从 0 起算；
@@ -1532,14 +1589,14 @@ pub fn encode(
                 q.push(e[3]); // Cb
                 q.push(e[4]); // alpha
             }
-            push_seg(&mut buf, PDS, pts, 0, &q)?;
+            push_seg(&mut buf, PDS, ctl_pts, base, &q)?;
             pal_ver = pal_ver.wrapping_add(1);
             n_pds += 1;
         }
         for (id, ver, w, h, rle) in &d.objs {
-            push_ods(&mut buf, pts, dts, *id, *ver, *w, *h, rle, &mut n_ods)?;
+            push_ods(&mut buf, pts, base, *id, *ver, *w, *h, rle, &mut n_ods)?;
         }
-        push_seg(&mut buf, END, pts, 0, &[])?;
+        push_seg(&mut buf, END, ctl_pts, base, &[])?;
         n_end += 1;
 
         if buf.len() - ds_start > 1 << 20 {
@@ -1567,9 +1624,14 @@ pub fn encode(
         "split_chains": n_split_chains,
         "split_frames": n_split_frames,
         "split_objects_reused": n_split_reused,
+        // 因「相邻 PTS 间隔 <= 窗口擦除时间」而省略 WDS 的 Acquisition Point 数
+        "wds_dropped": n_wds_dropped,
         "video": format!("{}x{}", vw, vh),
         "fps": bdn.fps,
         "lead_ticks": lead,
+        // 仅供诊断：按 Rd 估算的全屏对象理论上界。它可能大于 lead —— 这是
+        // HDMV PGS 的 display set buffering 模型，提前量不必覆盖单帧最坏解码时间。
+        "decode_upper_ticks": (PGS_HZ * plane / RD).ceil() as u32,
     }))
 }
 

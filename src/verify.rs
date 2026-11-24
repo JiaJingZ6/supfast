@@ -14,7 +14,10 @@
 //! 拼缝处的 PTS 单调性、epoch 完整性、缓冲占用从来没验证过。播放器能放 ≠ 合规。
 //!
 //! 注意两个工具链惯例，检查时不能误伤：
-//!   1. PDS / END 段的 DTS 写 0 表示「不适用」，要排除在 DTS 相关检查之外；
+//!   1. 默认拼段流（avs2bdnxml 输出经 sup_retime 重映射）把 PDS / END 的 DTS
+//!      写 0 表示「不适用」，要排除在 DTS 相关检查之外；内置 Rust 原生整流流
+//!      (`src/pgs.rs`) 不用这套约定 —— 同一显示集所有段共用一个 DTS，PDS / END
+//!      的 PTS 也取该值，以满足 SUPer `check_pts_dts_sanity` 的段级 DTS 单调要求；
 //!   2. avs2bdnxml 把 PDS 的 PTS 写成接近 2^32 的哨兵值，不代表时间。
 //! 另外 ODS 首片布局是 `id(2) ver(1) flags(1) len(3) w(2) h(2)`（宽高在 [7..11]），
 //! 与部分文档写的 4 字节 len 不同，按实际流解析。
@@ -577,7 +580,8 @@ fn verify_sup_bytes(data: &[u8]) -> Value {
     }
 
     // ---------- 4. 时序 ----------
-    // DTS==0 是 PDS/END 的「不适用」，必须排除，否则整片误报
+    // 拼段流把 PDS/END 的 DTS 写 0 表示「不适用」，必须排除，否则整片误报。
+    // 内置原生整流流已全段共用一个 DTS，不存在 dts=0。
     let mut eq_pts_dts = 0usize;
     let mut dts_gt_pts = 0usize;
     let mut lead_over_1s = 0usize;

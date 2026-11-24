@@ -129,11 +129,11 @@ display set buffering 提前解码，不能只看单个显示集的 `PTS−DTS`�
 | 对象复用 | 同一 epoch 内「位图 + 调色板」完全相同就复用 `object_id`，走 Normal Case，不重传 ODS |
 | 调色板渐变 | 连续同图、仅逐帧变色的事件压成「一张位图 + 逐帧调色板」，后续帧只发 palette update 显示集；序列种类超 255 时整链回退逐帧 ODS（零画质损失），详见下节 |
 | 帧间对象拆分 | 连续单图局部变化时，按最优分割线把每帧切成 2 个对象，逐帧只重传变化的那一块；无净收益或超预算就整链回退，同样零画质损失，详见下节 |
-| 显示集 | 组首 Epoch Start、新位图 Acquisition Point、空档补清屏显示集；Epoch Start / Acquisition 都带同一份 WDS |
-| 时序 | 同一显示集共用 PTS 与 DTS，`DTS = PTS − 按分辨率算的解码提前量`（全片常量、随 PTS 单调）；PDS / END 的 DTS 写 0 =「不适用」 |
+| 显示集 | 组首 Epoch Start、新位图 Acquisition Point、空档补清屏显示集；Epoch Start / Acquisition 都带同一份 WDS（逐帧大窗口踩线的 Acquisition 除外，见下节） |
+| 时序 | 同一显示集所有段共用一个 DTS = `PTS − lead`（`lead = wipe + 一帧`，1080p 为 9587）；PCS/WDS/ODS 的 PTS 取呈现时刻，PDS/END 的 PTS 也取该 DTS（规范强制 `dts == pts`）。段 DTS 全程非递减、生命周期 < 1 秒，SUPer `check_pts_dts_sanity` 全项通过，详见下节 |
 
 PNG 重复度越高收益越大：`test2.ass` 的 195 张 PNG 只有 52 张唯一内容，复用 127 次，
-SUP 从 3.37 MB 降到 1.32 MB；`drama.ass` 的图几乎张张不同，体积与原流基本持平。
+SUP 从 3.37 MB 降到 1.23 MB；`drama.ass` 的图几乎张张不同，体积与原流基本持平。
 
 | 样本 | 默认拼段流 | SUPer 重编码 | Rust 原生 PGS |
 |---|---|---|---|
@@ -169,11 +169,11 @@ SUP 从 3.37 MB 降到 1.32 MB；`drama.ass` 的图几乎张张不同，体积�
 | 渐变开 | 910 B | 9 | 1 | 7 | 12,288 采样 0 误差 |
 | 渐变关 | 3,101 B | 9 | 8 | 0 | 12,288 采样 0 误差 |
 
-真实素材上 `test2.ass` 没有可用链，产物体积与阶段一相同（仅 PDS 版本号按
-Acquisition Point 重置为 0，画面零变化）；`drama.ass` 识别出 1 条 2 帧链，
-体积 42,168,329 B（阶段一 42,176,509 B）。两者自检均 0 错 0 警、严格合规。
-用 SUPer 的 verifier 交叉验证，含渐变链的流结构检查 `is_compliant` 均返回
-`(True, 0)`（0 警告）。
+真实素材上 `test2.ass` 没有可用链（`fade_chains=0`），`drama.ass` 识别出 1 条 2 帧链。
+当前版本产物：`test2` 1,228,073 B、`drama` 42,168,260 B（阶段一分别为
+1,321,675 B / 42,176,509 B）。两者自检均 0 错 0 警、严格合规；用 SUPer 的
+verifier 交叉验证，`is_compliant` 返回 `(True, 0)`、`check_pts_dts_sanity` 返回
+`True`（详见 [已知限制](#已知限制)）。
 
 ### 帧间对象拆分（局部变化 / 滚动）
 
@@ -206,9 +206,35 @@ SUPer verifier 在 acquisition 时会清空对象缓冲（`ods_filled.clear()`�
 | 全关 | 175,957 B | 9 | 8 | 1 | 163,840 采样 0 误差 |
 
 省 71,625 B / 40.7%。只开拆分（`--no-palette-fade`）与默认产物逐字节一致；只关拆分
-（`--no-object-split`）等于全关 —— 说明两条链确实互斥且渐变优先。SUPer verifier 结构
-检查 `is_compliant` 返回 `(True, 0)`。真实素材 `test2.ass` / `drama.ass` 没有符合条件
-的单图局部变化链，`split_chains=0`，产物与阶段二逐字节一致。
+（`--no-object-split`）等于全关 —— 说明两条链确实互斥且渐变优先。SUPer verifier 的
+`is_compliant=(True, 0)` 且 `check_pts_dts_sanity=True`。真实素材 `test2.ass` /
+`drama.ass` 没有符合条件的单图局部变化链，`split_chains=0`。
+
+### 段时序合规（与 SUPer verifier 对拍）
+
+早期原生流把 PDS / END 的 DTS 写 0（沿用拼段工具链惯例），SUPer 的
+`check_pts_dts_sanity` 会判 PTS-DTS out of spec。这**不是模型差异，是真不合规**：
+avs2bdnxml 原版 `ref.sup` 在 SUPer 那 20 多条时序条件下全部通过，而我们的
+`dts=0` 被 SUPer 的 `PDS.__init__` / `END.__init__` 强制改写成显示集 PTS，夹在
+ODS（DTS 更早）之间就造成段 DTS 回退。现在按 `ref.sup` 的排布模板写段：
+
+| 段 | PTS | DTS |
+|---|---|---|
+| PCS / WDS / ODS | 显示集呈现时刻 `pts` | `base = pts − lead` |
+| PDS / END | `base` | `base`（规范强制 `dts == pts`） |
+
+`lead = wipe + 一帧`（`wipe = 画面面积·90k/Rc`，1080p 为 9587 ticks），同时落在
+`(wipe, 2·wipe]` 内，满足 Epoch Start 的 `PTS−DTS > wipe` 与 WDS 的
+`PTS−DTS ≤ 2·wipe`。配套三条规划约束：epoch 只在「显示集级空档 > lead」处切分
+（连续帧处切会让新 epoch 的 DTS 早于上一 epoch 的最后呈现，且口径要用显示集 PTS
+而不是事件 out）；逐帧连续的大窗口 Acquisition 在「相邻 PTS 间隔 ≤ 窗口擦除时间」
+时省略 WDS 并降级 Normal Case（`test_diplayset` 规定非 Normal Case 必须带 WDS，
+而带 WDS 又要求更大的显示集间隔）；PTS 严格递增。
+
+实测四个样本（合成淡入链 / 合成拆分链 / `test2` / `drama`）的 SUPer
+`is_compliant` 均为 `(True, 0)`、`check_pts_dts_sanity` 均为 `True`，内置自检同样
+0 错 0 警，逐像素解码比对 0 误差。**默认拼段流仍沿用 `DTS=0` 惯例**，见
+[已知限制](#已知限制)。
 
 **暂不支持**（后续阶段）：窗口布局优化，以及 SUPer 那种带 SSIM 容差的帧间合成
 （有损，本项目坚持零画质损失）。另外，单个显示集超过 1 MiB 会直接报错而不是产出
@@ -285,7 +311,11 @@ supfast.exe --engine pgs --xml test2.xml --out test2.nosplit.sup --no-object-spl
 - `verify` 输出 ok / compliant / errors / warnings / stats / lines；`lines` 就是日志页显示的那几行。
 - `pgs` 输出 bytes / display_sets / epochs / pcs / wds / pds / ods / end / objects_reused /
   palette_updates / fade_chains / fade_frames / split_chains / split_frames /
-  split_objects_reused / lead_ticks，外加对产物的 `verify` 自检报告。
+  split_objects_reused / lead_ticks / decode_upper_ticks / wds_dropped，外加对产物的
+  `verify` 自检报告。`lead_ticks` 是段 DTS 提前量（按 `wipe + 一帧` 取，1080p 为 9587）；
+  `decode_upper_ticks` 是按 Rd 估算的理论最坏解码时间，可能大于前者 —— 这是 PGS 的
+  display set buffering 模型。`wds_dropped` 是因「相邻 PTS 间隔不足窗口擦除时间」
+  而省略 WDS 并降级为 Normal Case 的显示集数。
   `--vw`/`--vh` 省略时按 XML 的 VideoFormat 推断；`--no-palette-fade` 关闭调色板渐变、
   `--no-object-split` 关闭帧间对象拆分。`verify` 的 `stats` 里另有 `palette_updates` /
   `pu_cobj_changed` / `pu_pds_version_bad` / `multi_obj_ds` / `max_cobjs` / `cobj_dup` /
@@ -426,14 +456,18 @@ tools\winbox.exe min "Google Chrome"    :: 截图前把挡在前面的窗口最�
 - **SUPer 不随包分发**：可选的「高质量 PGS」后端需要自行安装 GPL-3.0 的 SUPer，
   见 [SUPer 高质量 PGS（可选）](#super-高质量-pgs可选)。内置的
   [Rust 原生 PGS](#rust-原生-pgs内置--推荐) 不需要它，已带无损的调色板渐变与帧间对象拆分。
-- **两套 verifier 的时序模型不同**：文中的「0 错 0 警、严格合规」指 supfast 内置自检，
-  它按 HDMV PGS 解码器模型 + 拼段工具链惯例校准（`DTS = PTS − 常量提前量`，
-  PDS / END 的 DTS 写 0 表示「不适用」）。SUPer 的 `check_pts_dts_sanity` 用 buffered
-  display set 调度模型，额外要求相邻显示集 PTS 至少一帧间隔、PDS 的 `PTS == DTS`、
-  段级 DTS 单调且生命周期 < 1 秒，直接拿它判我们的整流流会报 PTS-DTS out of spec
-  —— 这是阶段一就存在的模型差异，不是调色板渐变 / 帧间对象拆分引入的。结构层面两者一致：
-  SUPer 的 `is_compliant` 对含渐变链、含拆分链的流均返回 `(True, 0)`。要 SUPer 全项通过请直接用
-  [SUPer 后端](#super-高质量-pgs可选)。
+- **原生整流流的时序分歧已解决**：早期版本把 PDS / END 的 DTS 写 0（沿用拼段工具链
+  惯例），SUPer 的 `check_pts_dts_sanity` 会判 PTS-DTS out of spec。现在同一显示集所有段
+  共用一个 DTS、PDS / END 的 PTS 也取该值，提前量收紧到 `(wipe, 2·wipe]`，epoch 只在
+  显示集级空档 > lead 处切分，逐帧连续的大窗口 Acquisition 省略 WDS 并降级 Normal Case。
+  实测四个样本（渐变链 / 拆分链 / test2 / drama）SUPer 的 `is_compliant` 均为
+  `(True, 0)`、`check_pts_dts_sanity` 均为 `True`，内置自检同样 0 错 0 警。
+  详见 [Rust 原生 PGS](#rust-原生-pgs内置--推荐)。
+- **默认拼段流仍沿用 DTS=0 惯例**：默认 `<名>.sup` 是 avs2bdnxml 各段输出经
+  `sup_retime` 重映射 PTS 拼起来的，不是整流流；PDS / END 仍写 `DTS=0`，拿 SUPer 的
+  `check_pts_dts_sanity` 判会报 out of spec。这是两套工具链的时间戳惯例差异
+  （avs2bdnxml 原始输出 `ref.sup` 本身全项通过），内置自检对此做了豁免；需要 SUPer
+  全项通过的整流流请勾 [Rust 原生 PGS](#rust-原生-pgs内置--推荐)。
 - 无边框窗口用 `data-tauri-drag-region` 拖动，**双击标题栏不会最大化**，用右上角按钮。
 - 目标机器需要 WebView2 运行时（Win10 1803+ 与 Win11 自带）。
 - 右键菜单是关掉的：WebView2 默认会弹「重新加载 / 另存为 / 打印 / 检查」，
