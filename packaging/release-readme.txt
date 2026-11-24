@@ -51,3 +51,19 @@ supfast 1.0.1 — 把 ASS / SSA 字幕按画面变化切段，只渲染必要的
   xxx.xml   BDN 字幕描述（可给 Scenarist / easyavs2bdnxml 流程用）
   xxx.sup   PGS 字幕流（可直接混流进 mkv / 蓝光结构）
   00000.png ...  渲染出的字幕帧
+
+可选的 SUPer 高质量 PGS
+------------------------
+软件自带的是一条快速的「逐段渲染 + 拼接」链路，日常够用。如果想要严格合规、
+支持卡拉OK / 遮罩 / 淡入淡出的 PGS，可以自行安装 GPL-3.0 的 SUPer
+（github.com/cubicibo/SUPer，需 Python 3.12+），然后在「高级选项 →
+SUPer 高质量 PGS」里打开开关并填 supercli.py 的路径。
+
+SUPer 不在本压缩包里，也不会随 supfast 分发；软件只是外部调用它。
+开启后每次转换会额外生成：
+  xxx.super.xml   给 SUPer 用的 BDN XML（事件时间轴已做单调化）
+  xxx.super.sup   SUPer 编出的严格合规 PGS
+  xxx.super.log   SUPer 的完整运行日志
+上面默认的 xxx.xml / xxx.sup / PNG 完全不变，「日志」页会给出两套 SUP 的
+合规自检对比。没装 SUPer 时开关灰着不影响正常使用。
+

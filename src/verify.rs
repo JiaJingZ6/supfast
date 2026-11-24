@@ -5,7 +5,9 @@
 //!   * RX（coded data）缓冲 1 MiB：同一 DTS 取走的段字节总和不得超
 //!   * object buffer 4 MiB：一个 epoch 内唯一 object_id 的位图面积总和不得超，且最多 64 个
 //!   * 图形解码器 Rd = 16e6 px/s、composition 控制器 Rc = 32e6 px/s
-//!   * DTS 严格单调且 < PTS；`PTS - 90000 < DTS`（PTS 最多超前 1 秒）
+//!   * DTS 非递减且 ≤ PTS；`PTS - DTS < 90000`（PTS 最多超前 1 秒）。
+//!     注意：PTS==DTS 是合法的（PES 里此时只写 PTS），PDS 段按规范甚至要求相等，
+//!     见 SUPer `bytestream/verifier.py:check_pts_dts_sanity`。以前把它当警告是误报。
 //!   * PCS 的 composition_state 高两位：0x80 Epoch Start / 0x40 Acquisition / 0x00 Normal
 //!
 //! 为什么要有这个：supfast 的 `.sup` 是把每段 avs2bdnxml 的输出重映射 PTS 后拼起来的，
@@ -18,7 +20,7 @@
 //! 与部分文档写的 4 字节 len 不同，按实际流解析。
 
 use serde_json::{json, Value};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::path::Path;
 
@@ -122,6 +124,16 @@ struct Ds {
     window_area: u64,
     objs: Vec<(u16, u64)>,
     wds: Vec<u8>,
+    /// PCS 引用的 (object_id, window_id)
+    refs: Vec<(u16, u8)>,
+    /// PCS 指定的 palette_id
+    palette_id: u8,
+    /// 本显示集里 PDS 定义的 palette_id
+    pds_ids: Vec<u8>,
+    /// 本显示集里 WDS 定义的 window_id
+    wds_ids: Vec<u8>,
+    /// ODS 分片：(object_id, sequence_flag, 首片声明的 data_length, 本片数据字节数)
+    ods_frags: Vec<(u16, u8, u32, usize)>,
     off: usize,
 }
 
@@ -210,10 +222,25 @@ fn verify_sup_bytes(data: &[u8]) -> Value {
                     dss.push(d);
                 }
                 let state = s.payload.get(7).copied().unwrap_or(0xC0) & 0xC0;
+                // PCS: w(2) h(2) rate(1) number(2) state(1) pal_upd(1) pal_id(1) nobj(1)
+                // 之后每个对象 object_id(2) window_id(1) cropped(1) x(2) y(2)
+                let p = s.payload;
+                let palette_id = p.get(9).copied().unwrap_or(0);
+                let nref = p.get(10).copied().unwrap_or(0) as usize;
+                let mut refs = Vec::new();
+                for k in 0..nref.min(16) {
+                    let o = 11 + k * 8;
+                    if o + 3 > p.len() {
+                        break;
+                    }
+                    refs.push((u16::from_be_bytes([p[o], p[o + 1]]), p[o + 2]));
+                }
                 cur = Some(Ds {
                     pts: s.pts, dts: s.dts, state, bytes: s.bytes as u64,
                     has_end: false, window_area: 0, objs: Vec::new(),
-                    wds: Vec::new(), off: s.off,
+                    wds: Vec::new(), refs, palette_id,
+                    pds_ids: Vec::new(), wds_ids: Vec::new(),
+                    ods_frags: Vec::new(), off: s.off,
                 });
             }
             END => {
@@ -232,9 +259,35 @@ fn verify_sup_bytes(data: &[u8]) -> Value {
                         WDS => {
                             d.window_area = d.window_area.max(wds_area(s.payload));
                             if d.wds.is_empty() { d.wds = s.payload.to_vec(); }
+                            let n = s.payload.first().copied().unwrap_or(0) as usize;
+                            for k in 0..n.min(2) {
+                                let o = 1 + k * 9;
+                                if o < s.payload.len() {
+                                    d.wds_ids.push(s.payload[o]);
+                                }
+                            }
+                        }
+                        PDS => {
+                            if let Some(&id) = s.payload.first() {
+                                d.pds_ids.push(id);
+                            }
                         }
                         ODS => {
                             if let Some(pair) = ods_area(s.payload) { d.objs.push(pair); }
+                            let q = s.payload;
+                            if q.len() >= 4 {
+                                let first = q[3] & 0x80 != 0;
+                                let declared = if first && q.len() >= 7 {
+                                    ((q[4] as u32) << 16) | ((q[5] as u32) << 8) | q[6] as u32
+                                } else {
+                                    0
+                                };
+                                // 首片多了 len(3)+w(2)+h(2)=7 字节头，续片只有 4 字节头
+                                let data_len = q.len().saturating_sub(if first { 11 } else { 4 });
+                                d.ods_frags.push((
+                                    u16::from_be_bytes([q[0], q[1]]), q[3], declared, data_len,
+                                ));
+                            }
                         }
                         _ => {}
                     }
@@ -327,6 +380,78 @@ fn verify_sup_bytes(data: &[u8]) -> Value {
             format!("{} 处 WDS 在同一 epoch 内发生变化（规范要求 epoch 内窗口定义不变）", wds_changed));
     }
 
+    // ---------- 3b. 显示集内部引用一致性 ----------
+    // 纯字节级结构约束，与解码器时序模型无关，任何合规流都必须满足。
+    // 瞬时码率只作统计展示，不判合规：拼段流的 DTS 是我们自己推导的，拿它算带宽会误伤。
+    let mut peak_mbps = 0.0f64;
+    let mut prev_dts: Option<u32> = None;
+    for (&t, &b) in &by_dts {
+        if let Some(pt) = prev_dts {
+            let dt = t.saturating_sub(pt) as f64 / PGS_HZ;
+            if dt > 0.0 {
+                peak_mbps = peak_mbps.max(b as f64 * 8.0 / dt / 1e6);
+            }
+        }
+        prev_dts = Some(t);
+    }
+
+    let mut bad_ods_len = 0usize;
+    let mut bad_ods_seq = 0usize;
+    for d in &dss {
+        let mut by_id: BTreeMap<u16, Vec<(u8, u32, usize)>> = BTreeMap::new();
+        for (id, flags, declared, data_len) in &d.ods_frags {
+            by_id.entry(*id).or_default().push((*flags, *declared, *data_len));
+        }
+        for frags in by_id.values() {
+            let first = frags[0];
+            let last = *frags.last().unwrap();
+            if frags.len() == 1 {
+                // 单片必须同时带 first(0x80) 和 last(0x40)
+                if first.0 & 0xC0 != 0xC0 { bad_ods_seq += 1; }
+            } else if first.0 & 0x80 == 0 || last.0 & 0x40 == 0 {
+                bad_ods_seq += 1;
+            }
+            let total: usize = frags.iter().map(|x| x.2).sum();
+            // object_data_length 含首片的 width/height 这 4 字节
+            if first.1 != (total + 4) as u32 { bad_ods_len += 1; }
+        }
+    }
+    if bad_ods_len > 0 {
+        add(&mut issues, "error", "ODS_LENGTH", format!(
+            "{} 个对象的 ODS data_length 声明与实际分片数据长度不符", bad_ods_len));
+    }
+    if bad_ods_seq > 0 {
+        add(&mut issues, "error", "ODS_SEQUENCE", format!(
+            "{} 个对象的 ODS 分片序列不完整（缺首片或末片标志）", bad_ods_seq));
+    }
+
+    // epoch start 清空对象缓冲；normal case 允许复用 epoch 内早先定义的对象
+    let mut defined: HashSet<u16> = HashSet::new();
+    let mut bad_ref = 0usize;
+    let mut bad_pal = 0usize;
+    let mut bad_win = 0usize;
+    for d in &dss {
+        if d.state == 0x80 { defined.clear(); }
+        for (id, _, _, _) in &d.ods_frags { defined.insert(*id); }
+        for (oid, wid) in &d.refs {
+            if !defined.contains(oid) { bad_ref += 1; }
+            if !d.wds_ids.is_empty() && !d.wds_ids.contains(wid) { bad_win += 1; }
+        }
+        if !d.pds_ids.is_empty() && !d.pds_ids.contains(&d.palette_id) { bad_pal += 1; }
+    }
+    if bad_ref > 0 {
+        add(&mut issues, "error", "OBJ_UNDEFINED", format!(
+            "{} 处 PCS 引用了 epoch 内没有 ODS 定义的 object_id", bad_ref));
+    }
+    if bad_pal > 0 {
+        add(&mut issues, "error", "PALETTE_MISMATCH", format!(
+            "{} 组显示集的 PCS palette_id 与同组 PDS 不符", bad_pal));
+    }
+    if bad_win > 0 {
+        add(&mut issues, "error", "WINDOW_MISMATCH", format!(
+            "{} 处 PCS 引用的 window_id 不在同组 WDS 里", bad_win));
+    }
+
     // ---------- 4. 时序 ----------
     // DTS==0 是 PDS/END 的「不适用」，必须排除，否则整片误报
     let mut eq_pts_dts = 0usize;
@@ -354,12 +479,9 @@ fn verify_sup_bytes(data: &[u8]) -> Value {
         add(&mut issues, "warn", "PTS_LEAD_1S",
             format!("{} 个段的 PTS 比 DTS 超前超过 1 秒（PTS−90000 < DTS）", lead_over_1s));
     }
-    if eq_pts_dts > 0 {
-        add(&mut issues, "warn", "PTS_EQ_DTS", format!(
-            "{}/{} 个有效 DTS 段 PTS==DTS（ITU H.222 要求 DTS<PTS；avs2bdnxml 拼接流常见，多数播放器容忍）",
-            eq_pts_dts, dts_total
-        ));
-    }
+    // PTS==DTS 不判不合规：H.222 的 PES 在两者相等时只写 PTS；SUPer 的
+    // check_pts_dts_sanity 更明确要求 PDS 段 pts==dts、只要求 ODS/WDS 的 pts!=dts。
+    // 早期版本把它列成警告，会误伤 SUPer 自己判定 compliant 的流，现只作统计。
     if dts_back > 0 {
         add(&mut issues, "warn", "DTS_NOT_MONO",
             format!("{} 处 DTS 小于前一段（PGS 要求 DTS 严格单调；ODS 提前解码时常见）", dts_back));
@@ -411,12 +533,9 @@ fn verify_sup_bytes(data: &[u8]) -> Value {
             worst_need = worst_need.max(need);
         }
     }
-    if tight > 0 {
-        add(&mut issues, "warn", "TIGHT_DECODE", format!(
-            "{} 组显示集的 PTS−DTS 间隔小于按 Rd/Rc 估算的解码耗时（最长需 {} tick ≈ {:.0} ms）",
-            tight, worst_need, worst_need as f64 / 90.0
-        ));
-    }
+    // 这里只作粗略估算、不判不合规：SUPer 靠 display set buffering 提前解码，
+    // 且它的 check_pts_dts_sanity 只对 epoch start 要求 PTS−DTS > 窗口擦除时间，
+    // 并非每个显示集都要满足 need。早期版本按本估算报 TIGHT_DECODE，会误伤合规流。
 
     // ---------- 6. 汇总 ----------
     let counts = |t: u8| segs.iter().filter(|s| s.typ == t).count();
@@ -441,6 +560,12 @@ fn verify_sup_bytes(data: &[u8]) -> Value {
         "video": format!("{}x{}", vw, vh),
         "duration_s": (dur_s * 1000.0).round() / 1000.0,
         "avg_mbps": (mbps * 100.0).round() / 100.0,
+        "peak_mbps": (peak_mbps * 100.0).round() / 100.0,
+        "ods_len_bad": bad_ods_len,
+        "ods_seq_bad": bad_ods_seq,
+        "obj_undefined": bad_ref,
+        "palette_bad": bad_pal,
+        "window_bad": bad_win,
         "rx_peak": rx_peak,
         "rx_limit": RX_BUFFER,
         "obj_peak": obj_peak,
@@ -448,8 +573,10 @@ fn verify_sup_bytes(data: &[u8]) -> Value {
         "max_obj_ids": max_obj_ids,
         "pts_back": pts_back.len(),
         "pts_eq_dts": eq_pts_dts,
+        "dts_valid": dts_total,
         "dts_back": dts_back,
         "tight_ds": tight,
+        "decode_need_max_ticks": worst_need,
     });
 
     let mut lines: Vec<Value> = Vec::new();
@@ -461,17 +588,21 @@ fn verify_sup_bytes(data: &[u8]) -> Value {
         segs.len(), dss.len(), epochs, clock(dur_ticks), kb(data.len() as u64)
     ));
     put(&mut lines, "dim", format!(
-        "结构  PCS {} · WDS {} · PDS {} · ODS {} · END {}   |   画面 {}×{}   |   平均 {:.2} Mbps",
-        counts(PCS), counts(WDS), counts(PDS), counts(ODS), counts(END), vw, vh, mbps
+        "结构  PCS {} · WDS {} · PDS {} · ODS {} · END {}   |   画面 {}×{}   |   平均 {:.2} Mbps · 瞬时峰值 {:.2} Mbps",
+        counts(PCS), counts(WDS), counts(PDS), counts(ODS), counts(END), vw, vh, mbps, peak_mbps
+    ));
+    put(&mut lines, "dim", format!(
+        "引用  ODS 长度 {} 异常 · 分片序列 {} 异常 · 未定义对象 {} · 调色板 {} · 窗口 {}",
+        bad_ods_len, bad_ods_seq, bad_ref, bad_pal, bad_win
     ));
     put(&mut lines, "dim", format!(
         "缓冲  RX 峰值 {} / {} · object 峰值 {} / {} · 单 epoch 最多 {} 个对象",
         kb(rx_peak), kb(RX_BUFFER), kb(obj_peak), kb(OBJ_BUFFER), max_obj_ids
     ));
     put(&mut lines, "dim", format!(
-        "时序  PCS PTS {} · DTS {} · PTS==DTS {} 段 · 解码余量不足 {} 组",
+        "时序  PCS PTS {} · DTS {} · PTS==DTS {} 段（合法，PDS 规范如此）· 提前量估算偏紧 {} 组（仅供参考）",
         if pts_back.is_empty() { "递增 OK" } else { "有倒退" },
-        if dts_back == 0 { "严格单调 OK" } else { "有回退" },
+        if dts_back == 0 { "非递减 OK" } else { "有回退" },
         eq_pts_dts, tight
     ));
     for x in errs.iter().take(MAX_LINE_ISSUES) {

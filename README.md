@@ -27,11 +27,11 @@
 | **转换** | 文件行（拖入 `.ass` 或从「最近」选）、帧率 / VideoFormat / 语言码 / 轨道名 / 并行度、切段计划、输出目录、高级选项 |
 | **切段计划** | 全片时间轴（灰＝静态段、橙＝动态段、空档＝无字幕），四个统计数字，段列表带「段条」 |
 | **历史** | 每次成功转换一行：时间 / 字幕 / PNG 数 / SUP 体积 / 耗时 / 较原版加速比 |
-| **环境** | `avs2bdnxml` / VSFilterMod / AviSynth / 内置引擎 五项自检 |
-| **日志** | 百分比 + 进度条 + 实时日志，可取消、可打开输出目录，转换收尾自动做 SUP 合规自检 |
+| **环境** | `avs2bdnxml` / VSFilterMod / AviSynth / 内置引擎 / SUPer（可选）六项自检 |
+| **日志** | 百分比 + 进度条 + 实时日志，可取消、可打开输出目录，收尾自动做 SUP 合规自检；开启 SUPer 时另给两套流的自检对比 |
 
 - **预设**一键套用输出规格：蓝光 23.976/1080p、PAL 高清 25/1080p、DVD 25/480p、电视 29.97/1080i。
-- **高级选项**（折叠）里是分辨率覆盖、mod 目录和七个合成开关。
+- **高级选项**（折叠）里是分辨率覆盖、mod 目录、七个合成开关，以及可选的 SUPer 重编码。
 
 | 开关 | 传给 avs2bdnxml | 作用 |
 |---|---|---|
@@ -77,23 +77,76 @@ DTS、并保证 PCS 的 PTS 跨段不倒退；转换收尾再**只读**体检一
 | 类别 | 检查 |
 |---|---|
 | 结构 | `PG` 段头对齐、负载长度、段类型、PCS…END 配对、首条 Epoch Start |
-| 时序 | PCS PTS 递增、DTS 严格单调且 < PTS、`PTS−DTS` ≤ 1 秒、PTS==DTS（H.222 禁止） |
+| 引用 | ODS 的 `data_length` 与分片序列、PCS 引用的 object_id 在 epoch 内已定义、palette_id 与同组 PDS 一致、window_id 与同组 WDS 一致 |
+| 时序 | PCS PTS 递增、DTS 非递减且 ≤ PTS、`PTS−DTS` < 1 秒 |
 | 缓冲 | 同一 DTS 取走的段 ≤ RX buffer 1 MiB；epoch 内对象面积 ≤ object buffer 4 MiB、唯一 object_id ≤ 64 |
-| 解码余量 | 按 Rd = 16e6 px/s、Rc = 32e6 px/s 估算 `PTS−DTS` 是否够完成清屏 / 解码 / 合成 |
+| 带宽 / 余量 | 平均与瞬时码率峰值（统计展示）；按 Rd = 16e6 px/s、Rc = 32e6 px/s 估算的「提前量偏紧」组数（仅供参考） |
 
 错误（红）是会导致画面错乱或播放失败的问题；警告（黄）是严格蓝光规范不合规、
 但多数播放器能容忍的情况。`ok` 只看错误，`compliant` 要求连警告都没有。
 自检不影响转换是否成功，也不改动 `.sup`。
 
-> 实测对照：原版 `avs2bdnxml` 单跑产出的 `ref.sup` 是 0 错误 0 警告（规则没有误伤正常流）。
-> supfast 当前产物：`drama.ass`（1832 段 / 10961 个 PGS 段）**0 错误 0 警告、严格合规**；
-> `test2.ass` 0 错误 2 警告，只剩 `WDS_CHANGED` 与 `PTS_DUP` —— 这两项来自「每段独立
-> epoch、相邻段区间偶有 1 帧重叠」，属拼接链路固有现象，多数播放器容忍。
+`PTS==DTS` 与「解码余量不足」只作统计、**不判不合规**：H.222 在两者相等时 PES 里
+只写 PTS，SUPer 的 `check_pts_dts_sanity` 更明确要求 PDS 段 `pts==dts`；而 SUPer 靠
+display set buffering 提前解码，不能只看单个显示集的 `PTS−DTS`。早期版本把这两项
+列为警告，会误伤 SUPer 自己判定 compliant 的流（下面的三方校准就是这么发现的）。
+
+> 实测对照（三方校准）：
+> - 原版 `avs2bdnxml` 单跑产出的 `ref.sup`：0 错误 0 警告；
+> - supfast 默认拼段流：`drama.ass`（1832 段 / 10961 个 PGS 段）**0 错误 0 警告、严格合规**；
+>   `test2.ass` 0 错误 2 警告（`WDS_CHANGED` / `PTS_DUP`）—— 来自「每段独立 epoch、
+>   相邻段区间偶有 1 帧重叠」，属拼接链路固有现象，多数播放器容忍；
+> - **SUPer 重新编码的 `.super.sup`：0 错误 0 警告、严格合规** —— 用权威编码器反向
+>   验证这套规则没有误伤合规流。
 >
 > 早先会报的 `PTS_EQ_DTS` / `DTS_NOT_MONO` / `TIGHT_DECODE` / `PTS_BACK` 已在
 > `sup_retime` 里修掉：同一显示集内各段共用呈现时刻，DTS = PTS − 按分辨率算出的解码
 > 提前量（全片统一，随 PTS 单调），起点落在上一段末尾之前的段整体平移一帧。
-> 要把剩下的 `WDS_CHANGED` / `PTS_DUP` 也消除，需要交给 SUPer 之类的 PGS 编码器重编码。
+> 要把剩下的 `WDS_CHANGED` / `PTS_DUP` 也消除，打开下面的 SUPer 后端即可。
+
+## SUPer 高质量 PGS（可选）
+
+`cubicibo/SUPer`（GPL-3.0-or-later）是完整的 HDMV PGS 编码器，吃 BDN XML + PNG，
+生成**严格合规**、支持卡拉OK / 遮罩 / 淡入淡出 / 移动的 SUP。supfast 默认走
+「逐段 avs2bdnxml + 拼接」，快但不做解码器时序优化；两者可以并存。
+
+supfast **不随包分发 SUPer**：GPL 与约 100 MB 的 Python 运行时都不允许塞进这个
+3 MB 的包。需要你自行安装，然后在「高级选项 → SUPer 高质量 PGS」打开开关、填路径。
+
+### 安装（Windows 示例）
+
+```bat
+python -m venv H://DIY//SUPer-cli//venv
+H://DIY//SUPer-cli//venv//Scripts//python.exe -m pip install "SUPer @ git+https://github.com/cubicibo/SUPer"
+:: 再把仓库根目录的 supercli.py 放到 H://DIY//SUPer-cli//，同目录放一份 config.ini
+:: （[SUPer] use_gpu=0 可避开没有 OpenCL 平台时的报错）
+```
+
+探测顺序：界面里填的路径 → `SUPFAST_SUPER_CMD` → exe 同目录 `SUPer\supercli.py` /
+`supercli.py` → `%APPDATA%\supfast-desktop\supercli.py` → PATH。目标是 `.py` 时，
+解释器按 `SUPFAST_SUPER_PY` → 脚本旁 `venv\Scripts\python.exe` → PATH 里的 python 找。
+也可以直接填一个自己写的 `.bat` / `.cmd` 启动器，软件只负责把参数透传过去。
+
+### 会产出什么
+
+开启后收尾额外生成（**不覆盖**默认产物，PNG / `.xml` / `.sup` 保持原样）：
+
+| 文件 | 说明 |
+|---|---|
+| `<字幕名>.super.xml` | 给 SUPer 的 BDN XML。拼段流相邻事件偶有 1 帧重叠，SUPer 要求严格单调，这份副本做了单调化平移；主 `.xml` 不动 |
+| `<字幕名>.super.sup` | SUPer 编出的严格合规 PGS |
+| `<字幕名>.super.log` | SUPer 的完整输出日志 |
+
+两套 SUP 都会在日志页各跑一次合规自检，并给出一行对比。
+实测 `test2.ass`：默认拼段流 0 错 2 警，**SUPer 那份 0 错 0 警、严格合规**。
+
+### 已知限制
+
+- Windows 上 SUPer 的多进程 worker 可能起不来（`Companion worker did not start.`），
+  所以固定 `-t 1`；单线程编 129 个事件约 5 秒，够用。想试多线程设
+  `SUPFAST_SUPER_THREADS`（1–10）。
+- 默认用内置 Qtzr 量化器（`-q 0`），不依赖外部 pngquant / libimagequant。
+- 编码耗时另计，不计入转换耗时统计；失败只写日志，不影响转换成功。
 
 ## 命令行（不进 GUI）
 
@@ -103,12 +156,13 @@ release 版是 windows 子系统、没有 stdout，所以结果写文件：
 supfast.exe --engine analyze --ass test.ass --json out.json
 supfast.exe --engine convert --ass test.ass --out out_dir --jobs 12 --json out.json
 supfast.exe --engine verify  --sup test.sup --json verify.json
+supfast.exe --engine convert --ass test.ass --super --super-cmd H://DIY//SUPer-cli//supercli.py --json out.json
 ```
 
 - `analyze` 输出 events / frames / segs / sta / dyn / work / ratio / w / h，以及 `bands`（全片时间轴）与 `timeline`。
   `warnings` 只放会影响结果的问题（ASS 的 Timer 与帧率不符、切段数超上限）；
   `notes` 是纯信息（全片静态、多少帧含动态标签），界面上记一次日志，不弹窗。
-- `convert` 输出 pngs / secs / speed / epochs / failed / sup_size / verify（同下的自检报告）。
+- `convert` 输出 pngs / secs / speed / epochs / failed / sup_size / verify（自检报告）/ super（SUPer 重编码报告，未开启时为 `null`）。
 - `verify` 输出 ok / compliant / errors / warnings / stats / lines；`lines` 就是日志页显示的那几行。
 
 ## 编译
@@ -238,6 +292,8 @@ tools\winbox.exe min "Google Chrome"    :: 截图前把挡在前面的窗口最�
 ## 已知限制
 
 - **没有安装包**：只产出 `exe` + `mod` 目录，绿色解压即用。
+- **SUPer 不随包分发**：可选的「高质量 PGS」后端需要自行安装 GPL-3.0 的 SUPer，
+  见 [SUPer 高质量 PGS（可选）](#super-高质量-pgs可选)。
 - 无边框窗口用 `data-tauri-drag-region` 拖动，**双击标题栏不会最大化**，用右上角按钮。
 - 目标机器需要 WebView2 运行时（Win10 1803+ 与 Win11 自带）。
 - 右键菜单是关掉的：WebView2 默认会弹「重新加载 / 另存为 / 打印 / 检查」，

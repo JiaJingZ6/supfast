@@ -726,6 +726,14 @@ body.dragging::after{
           <div class="sw" data-k="no_sup"><span>不生成 SUP</span><i class="knob"></i></div>
           <div class="sw" data-k="dry_run"><span>只看计划</span><i class="knob"></i></div>
         </div>
+        <div class="fld" style="margin-top:0;border-top:1px dashed var(--line);padding-top:14px">
+          <label>SUPer 高质量 PGS（可选 · 需自备）</label>
+          <div class="row" style="gap:10px;align-items:center">
+            <div class="sw" data-k="super_encode" style="flex:0 0 auto"><span>SUPer 重编码</span><i class="knob"></i></div>
+            <input class="sel" id="superCmd" placeholder="supercli.py 路径 / 启动器（留空 = 自动探测）" style="flex:1;min-width:0">
+          </div>
+          <p class="desc">用 SUPer（github.com/cubicibo/SUPer，GPL-3.0，需 Python ≥3.12）把 BDN XML 重新编码成严格合规的 PGS，额外产出 <code>&lt;字幕名&gt;.super.sup</code>，不覆盖原流、不改变 PNG。软件不随包分发 SUPer：请自行安装后填路径，或设环境变量 <code>SUPFAST_SUPER_CMD</code>。编码耗时另计，日志留在输出目录。</p>
+        </div>
       </div>
     </details>
   </section>
@@ -920,14 +928,14 @@ function showPane(k){
 $$('.tab').forEach(t => t.onclick = () => showPane(t.dataset.pane));
 
 /* ============================ 设置读写 ============================ */
-const FIELDS = ['fps','vfmt','lang','title','jobs','outdir','w','h','modRoot'];
-const TOGGLES = ['palette','autocrop','bufsplit','stricter','even_y','no_sup','dry_run'];
+const FIELDS = ['fps','vfmt','lang','title','jobs','outdir','w','h','modRoot','superCmd'];
+const TOGGLES = ['palette','autocrop','bufsplit','stricter','even_y','no_sup','dry_run','super_encode'];
 
 function readForm(){
   const o = {ass:S.ass, fps:$('#fps').value, vfmt:$('#vfmt').value,
     lang:$('#lang').value.trim() || 'und', title:$('#title').value.trim() || 'Undefined',
     jobs:+$('#jobs').value || 4, outdir:$('#outdir').value.trim(), mod_root:$('#modRoot').value.trim(),
-    theme:themeMode};
+    super_cmd:$('#superCmd').value.trim(), theme:themeMode};
   TOGGLES.forEach(k => o[k] = $(`.sw[data-k="${k}"]`).classList.contains('on') ? 1 : 0);
   o.width = +$('#w').value || 0;
   o.height = +$('#h').value || 0;
@@ -945,6 +953,7 @@ function applySettings(st){
   $('#title').value = st.title ?? 'Undefined';
   $('#jobs').value = st.jobs ?? 8;
   $('#outdir').value = '';   // 输出目录不跟着上次跑：留空就是默认的 <字幕目录>/<字幕名>/
+  $('#superCmd').value = st.super_cmd ?? '';
   $('#modRoot').value = st.mod_root ?? '';
   $('#w').value = st.width || '';
   $('#h').value = st.height || '';
