@@ -733,15 +733,7 @@ body.dragging::after{
             <div class="sw on" data-k="palette_fade" style="flex:0 0 auto"><span>调色板渐变</span><i class="knob"></i></div>
             <div class="sw on" data-k="object_split" style="flex:0 0 auto"><span>帧间对象拆分</span><i class="knob"></i></div>
           </div>
-          <p class="desc">用 supfast 自带的 Rust 编码器把 BDN XML + 索引 PNG 一次性规划成 PGS 流，额外产出 <code>&lt;字幕名&gt;.native.sup</code>，不覆盖原流、不改变 PNG。内置 epoch 划分、对象复用、ODS 分片、DTS/PTS 调度，以及<b>调色板渐变</b>（淡入淡出 / 卡拉OK 这类逐帧变色的字幕压成「一张位图 + 逐帧调色板」）与<b>帧间对象拆分</b>（把画面切成两块，逐帧只重传变化的那一块，无净收益时自动回退）——两项都是无损、可关；<b>不需要 Python 或 SUPer</b>。两套流都会在日志页各跑一次合规自检。</p>
-        </div>
-        <div class="fld" style="margin-top:0;border-top:1px dashed var(--line);padding-top:14px">
-          <label>SUPer 高质量 PGS（可选 · 需自备）</label>
-          <div class="row" style="gap:10px;align-items:center">
-            <div class="sw" data-k="super_encode" style="flex:0 0 auto"><span>SUPer 重编码</span><i class="knob"></i></div>
-            <input class="sel" id="superCmd" placeholder="supercli.py 路径 / 启动器（留空 = 自动探测）" style="flex:1;min-width:0">
-          </div>
-          <p class="desc">用 SUPer（github.com/cubicibo/SUPer，GPL-3.0，需 Python ≥3.12）把 BDN XML 重新编码成严格合规的 PGS，额外产出 <code>&lt;字幕名&gt;.super.sup</code>，不覆盖原流、不改变 PNG。软件不随包分发 SUPer：请自行安装后填路径，或设环境变量 <code>SUPFAST_SUPER_CMD</code>。编码耗时另计，日志留在输出目录。</p>
+          <p class="desc">用 supfast 自带的 Rust 编码器把 BDN XML + 索引 PNG 一次性规划成 PGS 流，额外产出 <code>&lt;字幕名&gt;.native.sup</code>，不覆盖原流、不改变 PNG。内置 epoch 划分、对象复用、ODS 分片、DTS/PTS 调度，以及<b>调色板渐变</b>（淡入淡出 / 卡拉OK 这类逐帧变色的字幕压成「一张位图 + 逐帧调色板」）与<b>帧间对象拆分</b>（把画面切成两块，逐帧只重传变化的那一块，无净收益时自动回退）——两项都是无损、可关；<b>不需要 Python 或任何外部编码器</b>。两套流都会在日志页各跑一次合规自检。</p>
         </div>
       </div>
     </details>
@@ -937,14 +929,14 @@ function showPane(k){
 $$('.tab').forEach(t => t.onclick = () => showPane(t.dataset.pane));
 
 /* ============================ 设置读写 ============================ */
-const FIELDS = ['fps','vfmt','lang','title','jobs','outdir','w','h','modRoot','superCmd'];
-const TOGGLES = ['palette','autocrop','bufsplit','stricter','even_y','no_sup','dry_run','super_encode','native_pgs','palette_fade','object_split'];
+const FIELDS = ['fps','vfmt','lang','title','jobs','outdir','w','h','modRoot'];
+const TOGGLES = ['palette','autocrop','bufsplit','stricter','even_y','no_sup','dry_run','native_pgs','palette_fade','object_split'];
 
 function readForm(){
   const o = {ass:S.ass, fps:$('#fps').value, vfmt:$('#vfmt').value,
     lang:$('#lang').value.trim() || 'und', title:$('#title').value.trim() || 'Undefined',
     jobs:+$('#jobs').value || 4, outdir:$('#outdir').value.trim(), mod_root:$('#modRoot').value.trim(),
-    super_cmd:$('#superCmd').value.trim(), theme:themeMode};
+    theme:themeMode};
   TOGGLES.forEach(k => o[k] = $(`.sw[data-k="${k}"]`).classList.contains('on') ? 1 : 0);
   o.width = +$('#w').value || 0;
   o.height = +$('#h').value || 0;
@@ -962,7 +954,6 @@ function applySettings(st){
   $('#title').value = st.title ?? 'Undefined';
   $('#jobs').value = st.jobs ?? 8;
   $('#outdir').value = '';   // 输出目录不跟着上次跑：留空就是默认的 <字幕目录>/<字幕名>/
-  $('#superCmd').value = st.super_cmd ?? '';
   $('#modRoot').value = st.mod_root ?? '';
   $('#w').value = st.width || '';
   $('#h').value = st.height || '';

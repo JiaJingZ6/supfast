@@ -480,7 +480,7 @@ fn ticks(frame: u32, fps: f64) -> u32 {
     ((frame as f64) * PGS_HZ / fps).round() as u32
 }
 
-/// 与 engine::mono_times 相同的单调化：起点落在上一段结尾之前就整段平移
+/// 消除相邻事件重叠：起点落在上一段结尾之前就整段平移
 fn mono_times(bdn: &Bdn) -> Vec<(u32, u32)> {
     let mut v = Vec::with_capacity(bdn.events.len());
     let mut last_out = 0u32;

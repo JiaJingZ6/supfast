@@ -55,7 +55,6 @@
 | [src/baseline.rs](file:///H:/DIY/rea_sup/tauri/src/baseline.rs) | 对拍基准：内容轨 + 名义/有效双时间轴 + decode_risk、黄金帧清单、参考 PNG | 改判据时 |
 | [src/pngutil.rs](file:///H:/DIY/rea_sup/tauri/src/pngutil.rs) | 极简 PNG 读写（8bit RGB/RGBA，flate2），基准与真机对照共用 | 改参考画面格式时 |
 | [src/compare.rs](file:///H:/DIY/rea_sup/tauri/src/compare.rs) | 真机录屏对照：ffmpeg 抽帧 → bbox 裁剪 → 逐像素比对 + 差异热图 | 改真机判据时 |
-| [src/superenc.rs](file:///H:/DIY/rea_sup/tauri/src/superenc.rs) | 可选 SUPer 外部调用 | 换后端时 |
 | [tools/baseline.ps1](file:///H:/DIY/rea_sup/tauri/tools/baseline.ps1) | 一键跑四组样本的对拍基准，产出 JSON + Markdown 摘要 | 加样本时 |
 | [tools/compare_recording.ps1](file:///H:/DIY/rea_sup/tauri/tools/compare_recording.ps1) | 真机录屏对照一键脚本，产出 JSON + 摘要 + 截图 | 加真机样本时 |
 | [tools/gcc_shim.rs](file:///H:/DIY/rea_sup/tauri/tools/gcc_shim.rs) | 编译期工具链垫片（windres 需要 `gcc -E`） | 见 7.3 |
@@ -283,7 +282,7 @@ engine.rs 是纯函数式引擎，不依赖 `tauri::*`，只依赖 `serde_json` 
 输入 PNG 已由 `avs2bdnxml -p 1` 量化好，所以不需要量化器；唯一第三方依赖是
 纯 Rust 的 `flate2`（zlib 解压 IDAT）。
 
-流水线：`parse_bdn` → `mono_times`（与 `super.xml` 同一套单调化）→ `group_epochs`
+流水线：`parse_bdn` → `mono_times`（消除相邻事件重叠）→ `group_epochs`
 （按对象面积 3 MiB / 60 个 id / 2 秒空档切 epoch，且只允许在「显示集级空档 > lead」
 处切）→ 逐 epoch `find_fade_chains` 规划调色板动画链 → `find_split_chains`
 规划帧间拆分链 → 解码 PNG 规划普通显示集 → PTS 严格递增修正 → 段时序合规化
@@ -620,7 +619,7 @@ Tauri 2 的权限白名单，作用于 `main` 窗口：
 | 加一个新参数/开关 | `ui` 表单 + `readForm` → `read_opts`/`RunOpts` → `avs_for_segment` 或 `args` 拼装 → `DEFAULT_SETTINGS` |
 | 改切段规则 | `engine::build_segments` + `is_dynamic`（注意签名语义） |
 | 改产物布局 | `engine::resolve_outdir`（前端只展示后端算出的 `outdir`） |
-| 改 SUP 编码方式 | `src/pgs.rs`（原生整流 / 调色板渐变）或 `src/superenc.rs`（外部 SUPer）；两者都只吃 XML + PNG，产物并列不覆盖默认 `.sup` |
+| 改 SUP 编码方式 | `src/pgs.rs`（原生整流 / 调色板渐变 / 帧间对象拆分）；只吃 XML + PNG，产物 `<名>.native.sup` 并列不覆盖默认 `.sup` |
 | 跑真机验证前的对拍基准 | `tools\baseline.bat` → `tools\baseline.ps1` → `--engine baseline`；改判据看 `src/baseline.rs`，改解码语义看 `src/pgsdec.rs` |
 | 拿录屏核对真机输出 | `tools\compare_recording.bat -Frames <frames.json> -Recording <rec.mp4> -OffsetMs <ms>` → `--engine compare`；改判据看 `src/compare.rs` |
 | 加一个 IPC 接口 | `main::route` 分支 + 前端 `rpc('/api/xxx')`；窗口/对话框等系统能力还要改 `capabilities/default.json` |

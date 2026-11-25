@@ -28,12 +28,12 @@
 | **转换** | 文件行（拖入 `.ass` 或从「最近」选）、帧率 / VideoFormat / 语言码 / 轨道名 / 并行度、切段计划、输出目录、高级选项 |
 | **切段计划** | 全片时间轴（灰＝静态段、橙＝动态段、空档＝无字幕），四个统计数字，段列表带「段条」 |
 | **历史** | 每次成功转换一行：时间 / 字幕 / PNG 数 / SUP 体积 / 耗时 / 较原版加速比 |
-| **环境** | `avs2bdnxml` / VSFilterMod / AviSynth / 内置引擎 / SUPer（可选）六项自检；Rust 原生 PGS 是内置的，不需要额外环境 |
-| **日志** | 百分比 + 进度条 + 实时日志，可取消、可打开输出目录，收尾自动做 SUP 合规自检；开启原生 PGS / SUPer 时另给多套流的自检对比 |
+| **环境** | `avs2bdnxml` / VSFilterMod / AviSynth / WebView2 / 内置引擎五项自检；Rust 原生 PGS 是内置的，不需要额外环境 |
+| **日志** | 百分比 + 进度条 + 实时日志，可取消、可打开输出目录，收尾自动做 SUP 合规自检；开启原生 PGS 时另给一套流的自检对比 |
 
 - **预设**一键套用输出规格：蓝光 23.976/1080p、PAL 高清 25/1080p、DVD 25/480p、电视 29.97/1080i。
 - **高级选项**（折叠）里是分辨率覆盖、mod 目录、七个合成开关，以及可选的
-  Rust 原生 PGS 整流（内含「调色板渐变」开关）与 SUPer 重编码。
+  Rust 原生 PGS 整流（内含「调色板渐变」「帧间对象拆分」开关）。
 
 | 开关 | 传给 avs2bdnxml | 作用 |
 |---|---|---|
@@ -57,7 +57,6 @@
 ├─ <字幕名>.xml           BDN 字幕（PNG 序列的时序与坐标）
 ├─ <字幕名>.sup           PGS 流（默认拼段），可直接 mux 进 m2ts / mkv
 ├─ <字幕名>.native.sup    Rust 原生整流 PGS（开启「Rust 原生 PGS」时）
-├─ <字幕名>.super.sup     SUPer 重编码 PGS（开启 SUPer 时）
 └─ <帧号>.png             按需渲染的图形
 ```
 
@@ -93,15 +92,16 @@ DTS、并保证 PCS 的 PTS 跨段不倒退；转换收尾再**只读**体检一
 `PTS==DTS` 与「解码余量不足」只作统计、**不判不合规**：H.222 在两者相等时 PES 里
 只写 PTS，SUPer 的 `check_pts_dts_sanity` 更明确要求 PDS 段 `pts==dts`；而 SUPer 靠
 display set buffering 提前解码，不能只看单个显示集的 `PTS−DTS`。早期版本把这两项
-列为警告，会误伤 SUPer 自己判定 compliant 的流（下面的三方校准就是这么发现的）。
+列为警告，会误伤 SUPer 自己判定 compliant 的流（下面的实测对照就是这么发现的）。
 
-> 实测对照（三方校准，2026-11 默认流时序合规化后）：
+> 实测对照（2026-11 默认流时序合规化后）：
 > - 原版 `avs2bdnxml` 单跑产出的 `ref.sup`：0 错误 0 警告；
 > - supfast 默认拼段流：`drama.ass`（1832 段 / 10961 个 PGS 段）**0 错误 0 警告、严格合规**；
 >   `test2.ass` 0 错误 1 警告（`WDS_CHANGED` 22 处）—— 来自「每段独立 epoch、
 >   相邻段窗口定义偶有变化」，属拼接链路固有现象，多数播放器容忍；`PTS_DUP` 已消除；
-> - **SUPer 重新编码的 `.super.sup`：0 错误 0 警告、严格合规** —— 用权威编码器反向
->   验证这套规则没有误伤合规流。
+> - 离线对照：用第三方权威编码器 SUPer 对同一份 BDN 单独重编码的 SUP，
+>   0 错误 0 警告、严格合规 —— 反向验证这套规则没有误伤合规流（该编码器
+>   不随 supfast 分发，仅供校准）。
 > - **Rust 原生整流流 `.native.sup`：0 错误 0 警告、严格合规**，且首个 ODS 解码后
 >   与源 PNG 逐像素一致 —— `test2.ass` 上顺带把体积从 3.37 MB 压到 1.32 MB。
 >
@@ -110,7 +110,7 @@ display set buffering 提前解码，不能只看单个显示集的 `PTS−DTS`�
 > 模板（同一显示集所有段 DTS = `PTS − lead`，PDS / END 的 `PTS = DTS`，见
 > [段时序合规](#段时序合规与-super-verifier-对拍)），SUPer `check_pts_dts_sanity`
 > 对 test2 / drama 默认流均由 `False` 变为 `True`。要把剩下的 `WDS_CHANGED` 也消除，
-> 打开下面的 Rust 原生 PGS（内置、推荐）或 SUPer 后端即可。
+> 打开下面的 Rust 原生 PGS（内置、推荐）即可。
 
 ## Rust 原生 PGS（内置 · 推荐）
 
@@ -136,12 +136,12 @@ display set buffering 提前解码，不能只看单个显示集的 `PTS−DTS`�
 PNG 重复度越高收益越大：`test2.ass` 的 195 张 PNG 只有 52 张唯一内容，复用 127 次，
 SUP 从 3.37 MB 降到 1.23 MB；`drama.ass` 的图几乎张张不同，体积与原流基本持平。
 
-| 样本 | 默认拼段流 | SUPer 重编码 | Rust 原生 PGS |
-|---|---|---|---|
-| `test2.ass` | 3.37 MB / 0 错 1 警 | 3.42 MB / 0 错 0 警 | **1.32 MB / 0 错 0 警** |
-| `drama.ass` | 42.27 MB / 0 错 0 警 | 43.07 MB / 0 错 0 警 | **42.18 MB / 0 错 0 警** |
+| 样本 | 默认拼段流 | Rust 原生 PGS |
+|---|---|---|
+| `test2.ass` | 3.37 MB / 0 错 1 警 | **1.32 MB / 0 错 0 警** |
+| `drama.ass` | 42.27 MB / 0 错 0 警 | **42.18 MB / 0 错 0 警** |
 
-不需要 `avs2bdnxml` 的 SUP 输出、不需要 Python / SUPer；只多一个纯 Rust 的 `flate2`
+不需要 `avs2bdnxml` 的 SUP 输出、不需要 Python 或任何外部编码器；只多一个纯 Rust 的 `flate2`
 （解压 PNG 的 zlib 数据），无 DLL、静态链接。两套 SUP 都会在日志页各跑一次合规自检。
 
 ### 调色板渐变（淡入淡出 / 卡拉OK）
@@ -262,7 +262,7 @@ ODS（DTS 更早）之间就造成段 DTS 回退。现在按 `ref.sup` 的排布
 `avs2bdnxml` 分段输出固有的 `Window change mid-epoch` / `Object-slot dimensions
 mismatch` / `Object ID … is reserved` 结构性错误，改前改后 verifier 日志行数同为
 48，且时序相关日志从 221 行降为 0。要连这些结构错误一起消除，用
-[Rust 原生 PGS](#rust-原生-pgs内置--推荐) 或 SUPer 后端重编码即可。
+[Rust 原生 PGS](#rust-原生-pgs内置--推荐) 重编码即可。
 
 **暂不支持**（后续阶段）：窗口布局优化，以及 SUPer 那种带 SSIM 容差的帧间合成
 （有损，本项目坚持零画质损失）。另外，单个显示集超过 1 MiB 会直接报错而不是产出
@@ -400,51 +400,6 @@ DTS 单调性）；`pairs[]` 分 `content` / `timeline` 两段，`timeline` 内�
 - 源头对拍按事件序号对齐，PTS 差只作参考；导出的参考 PNG 是标准 BT.709/601
   反变换的 8bit RGBA，仅供录屏对照，不参与软基准判据。
 
-## SUPer 高质量 PGS（可选）
-
-`cubicibo/SUPer`（GPL-3.0-or-later）是完整的 HDMV PGS 编码器，吃 BDN XML + PNG，
-生成**严格合规**、支持卡拉OK / 遮罩 / 淡入淡出 / 移动的 SUP。supfast 默认走
-「逐段 avs2bdnxml + 拼接」，快，2026-11 起也做了段时序合规化；但分段输出仍会留下
-窗口定义变化等结构性警告，SUPer 与内置 Rust 原生 PGS 才能产出零警告整流流。三者可以并存。
-
-supfast **不随包分发 SUPer**：GPL 与约 100 MB 的 Python 运行时都不允许塞进这个
-3 MB 的包。需要你自行安装，然后在「高级选项 → SUPer 高质量 PGS」打开开关、填路径。
-
-### 安装（Windows 示例）
-
-```bat
-python -m venv H://DIY//SUPer-cli//venv
-H://DIY//SUPer-cli//venv//Scripts//python.exe -m pip install "SUPer @ git+https://github.com/cubicibo/SUPer"
-:: 再把仓库根目录的 supercli.py 放到 H://DIY//SUPer-cli//，同目录放一份 config.ini
-:: （[SUPer] use_gpu=0 可避开没有 OpenCL 平台时的报错）
-```
-
-探测顺序：界面里填的路径 → `SUPFAST_SUPER_CMD` → exe 同目录 `SUPer\supercli.py` /
-`supercli.py` → `%APPDATA%\supfast-desktop\supercli.py` → PATH。目标是 `.py` 时，
-解释器按 `SUPFAST_SUPER_PY` → 脚本旁 `venv\Scripts\python.exe` → PATH 里的 python 找。
-也可以直接填一个自己写的 `.bat` / `.cmd` 启动器，软件只负责把参数透传过去。
-
-### 会产出什么
-
-开启后收尾额外生成（**不覆盖**默认产物，PNG / `.xml` / `.sup` 保持原样）：
-
-| 文件 | 说明 |
-|---|---|
-| `<字幕名>.super.xml` | 给 SUPer 的 BDN XML。拼段流相邻事件偶有 1 帧重叠，SUPer 要求严格单调，这份副本做了单调化平移；主 `.xml` 不动 |
-| `<字幕名>.super.sup` | SUPer 编出的严格合规 PGS |
-| `<字幕名>.super.log` | SUPer 的完整输出日志 |
-
-两套 SUP 都会在日志页各跑一次合规自检，并给出一行对比。
-实测 `test2.ass`：默认拼段流 0 错 1 警（时序已合规），**SUPer 那份 0 错 0 警、严格合规**。
-
-### 已知限制
-
-- Windows 上 SUPer 的多进程 worker 可能起不来（`Companion worker did not start.`），
-  所以固定 `-t 1`；单线程编 129 个事件约 5 秒，够用。想试多线程设
-  `SUPFAST_SUPER_THREADS`（1–10）。
-- 默认用内置 Qtzr 量化器（`-q 0`），不依赖外部 pngquant / libimagequant。
-- 编码耗时另计，不计入转换耗时统计；失败只写日志，不影响转换成功。
-
 ## 命令行（不进 GUI）
 
 release 版是 windows 子系统、没有 stdout，所以结果写文件：
@@ -454,7 +409,6 @@ supfast.exe --engine analyze --ass test.ass --json out.json
 supfast.exe --engine convert --ass test.ass --out out_dir --jobs 12 --json out.json
 supfast.exe --engine verify  --sup test.sup --json verify.json
 supfast.exe --engine convert --ass test.ass --native-pgs --json out.json
-supfast.exe --engine convert --ass test.ass --super --super-cmd H://DIY//SUPer-cli//supercli.py --json out.json
 :: 对已有的 BDN XML + 同目录 PNG 单独跑原生编码器（不重渲字幕）
 supfast.exe --engine pgs --xml test2.xml --json pgs.json
 supfast.exe --engine pgs --xml test2.xml --out test2.native.sup --vw 1920 --vh 1080 --json pgs.json
@@ -471,7 +425,7 @@ tools\baseline.bat
   `warnings` 只放会影响结果的问题（ASS 的 Timer 与帧率不符、切段数超上限）；
   `notes` 是纯信息（全片静态、多少帧含动态标签），界面上记一次日志，不弹窗。
 - `convert` 输出 pngs / secs / speed / epochs / failed / sup_size / verify（自检报告）/
-  super（SUPer 重编码报告）/ native（Rust 原生 PGS 报告），未开启的后端为 `null`。
+  native（Rust 原生 PGS 报告），未开启时后者为 `null`。
 - `verify` 输出 ok / compliant / errors / warnings / stats / lines；`lines` 就是日志页显示的那几行。
 - `pgs` 输出 bytes / display_sets / epochs / pcs / wds / pds / ods / end / objects_reused /
   palette_updates / fade_chains / fade_frames / split_chains / split_frames /
@@ -520,7 +474,6 @@ dist\
 ├─ src\pngutil.rs             极简 PNG 读写（8bit RGB/RGBA，flate2），基准与真机对照共用
 ├─ src\compare.rs             真机录屏对照：ffmpeg 抽帧 → bbox 裁剪 → 逐像素比对 + 差异热图
 ├─ src\verify.rs               SUP 合规自检（零依赖，含 palette update / 多对象显示集检查）
-├─ src\superenc.rs             可选 SUPer 外部调用
 ├─ src\main.rs                 IPC 路由 + 状态持久化 + 命令行入口
 ├─ ui\index.html               界面（单文件 HTML + CSS + JS）
 ├─ tools\baseline.bat / .ps1   一键跑四组样本的对拍基准（结果进 tools\baseline-results\）
@@ -627,9 +580,6 @@ tools\winbox.exe min "Google Chrome"    :: 截图前把挡在前面的窗口最�
 ## 已知限制
 
 - **没有安装包**：只产出 `exe` + `mod` 目录，绿色解压即用。
-- **SUPer 不随包分发**：可选的「高质量 PGS」后端需要自行安装 GPL-3.0 的 SUPer，
-  见 [SUPer 高质量 PGS（可选）](#super-高质量-pgs可选)。内置的
-  [Rust 原生 PGS](#rust-原生-pgs内置--推荐) 不需要它，已带无损的调色板渐变与帧间对象拆分。
 - **段时序分歧已解决，两条工具链统一**：早期把 PDS / END 的 DTS 写 0（沿用拼段
   工具链惯例），SUPer 的 `check_pts_dts_sanity` 会判 PTS-DTS out of spec。现在
   `sup_retime`（默认拼段流）与 `src/pgs.rs`（原生整流流）都用同一套模板：同一显示集

@@ -6,7 +6,6 @@
 
 mod engine;
 mod verify;
-mod superenc;
 mod pgs;
 mod pgsdec;
 mod baseline;
@@ -61,7 +60,7 @@ const DEFAULT_SETTINGS: &str = r#"{
   "mod_root":"","fps":"23.976","vfmt":"1080p","lang":"zho","title":"Undefined",
   "theme":"auto","jobs":8,"outdir":"",
   "palette":1,"autocrop":1,"bufsplit":1,"stricter":0,"even_y":0,"no_sup":0,"dry_run":0,
-  "super_encode":0,"native_pgs":0,"palette_fade":1,"object_split":1
+  "native_pgs":0,"palette_fade":1,"object_split":1
 }"#;
 
 impl Shared {
@@ -84,6 +83,11 @@ impl Shared {
                     history = arr.iter().take(40).cloned().collect();
                 }
             }
+        }
+        // 兼容历史 state.json：外部 SUPer 后端已移除，别把旧开关带进新设置。
+        if let Some(obj) = settings.as_object_mut() {
+            obj.remove("super_encode");
+            obj.remove("super_cmd");
         }
 
         Shared {
@@ -133,15 +137,6 @@ impl Shared {
             .and_then(|x| x.as_str())
             .map(|x| x.to_string())
             .filter(|x| !x.is_empty())
-    }
-
-    /// SUPer CLI 路径（可选后端）。单独一个方法，避免和 mod_root 同时锁 settings 造成重入。
-    fn super_cmd(&self) -> String {
-        let s = lock(&self.settings);
-        s.get("super_cmd")
-            .and_then(|x| x.as_str())
-            .unwrap_or("")
-            .to_string()
     }
 }
 
@@ -233,8 +228,7 @@ fn route(sh: &Shared, route: &str, body: &Value) -> Result<Value, String> {
     match path {
         // ---------------- 首屏 ----------------
         "/api/boot" => {
-            let sc = sh.super_cmd();
-            let env = engine::probe_env(sh.mod_root().as_deref(), &sc);
+            let env = engine::probe_env(sh.mod_root().as_deref());
             Ok(json!({
                 "ok": true,
                 "settings": lock(&sh.settings).clone(),
@@ -260,8 +254,7 @@ fn route(sh: &Shared, route: &str, body: &Value) -> Result<Value, String> {
                 }
             }
             sh.save();
-            let sc = sh.super_cmd();
-            let env = engine::probe_env(sh.mod_root().as_deref(), &sc);
+            let env = engine::probe_env(sh.mod_root().as_deref());
             Ok(json!({
                 "ok": true,
                 "env": env.get("items").cloned().unwrap_or(json!([])),
@@ -370,11 +363,6 @@ fn route(sh: &Shared, route: &str, body: &Value) -> Result<Value, String> {
                                 j.pct = 96.0;
                                 drop(j);
                                 sh3.push_log("重写 XML / 重映射 PTS…".into(), "dim");
-                            } else if name == "super" {
-                                j.stage = "write".into();
-                                j.pct = 98.0;
-                                drop(j);
-                                sh3.push_log("SUPer 重新编码 PGS（可能要几分钟）…".into(), "dim");
                             }
                         }
                         "seg" => {
@@ -447,67 +435,8 @@ fn route(sh: &Shared, route: &str, body: &Value) -> Result<Value, String> {
                                 }
                             }
                         }
-                        // 可选后端：SUPer 重编码结果 + 两套流的自检对比。
-                        // 重编码失败不影响「转换成功」，只记日志。
-                        if let Some(s) = v.get("super").and_then(|x| x.as_object()) {
-                            let sok = s.get("ok").and_then(|x| x.as_bool()).unwrap_or(false);
-                            sh2.push_log(
-                                format!("SUPer 高质量 PGS · {}", if sok { "完成" } else { "未执行" }),
-                                if sok { "cmd" } else { "warn" },
-                            );
-                            if sok {
-                                sh2.push_log(
-                                    format!(
-                                        "  {} · {} · {:.1}s",
-                                        s.get("path").and_then(|x| x.as_str()).unwrap_or(""),
-                                        fmt_n(s.get("size").and_then(|x| x.as_u64()).unwrap_or(0) as i64),
-                                        s.get("secs").and_then(|x| x.as_f64()).unwrap_or(0.0)
-                                    ),
-                                    "dim",
-                                );
-                                let brief = |r: &Value| -> String {
-                                    let st = r.get("stats").cloned().unwrap_or(json!({}));
-                                    format!(
-                                        "{} / {} / {} 错 / {} 警",
-                                        st.get("segments").and_then(|y| y.as_u64()).unwrap_or(0),
-                                        st.get("display_sets").and_then(|y| y.as_u64()).unwrap_or(0),
-                                        r.get("errors").and_then(|y| y.as_array()).map(|a| a.len()).unwrap_or(0),
-                                        r.get("warnings").and_then(|y| y.as_array()).map(|a| a.len()).unwrap_or(0)
-                                    )
-                                };
-                                sh2.push_log(
-                                    format!(
-                                        "  自检对比  拼段流 {}   |   SUPer {}",
-                                        brief(v.get("verify").unwrap_or(&json!({}))),
-                                        brief(s.get("verify").unwrap_or(&json!({})))
-                                    ),
-                                    "dim",
-                                );
-                                // SUPer 那份只推结论行，避免日志被两套完整报告刷屏
-                                if let Some(arr) = s.get("verify").and_then(|x| x.get("lines")).and_then(|x| x.as_array()) {
-                                    if let Some(l) = arr.last() {
-                                        let line = l.get("line").and_then(|x| x.as_str()).unwrap_or("");
-                                        let kind = l.get("kind").and_then(|x| x.as_str()).unwrap_or("dim");
-                                        if !line.is_empty() {
-                                            sh2.push_log(format!("  {}", line), kind);
-                                        }
-                                    }
-                                }
-                            } else {
-                                sh2.push_log(
-                                    format!("  {}", s.get("error").and_then(|x| x.as_str()).unwrap_or("未知原因")),
-                                    "err",
-                                );
-                                let log = s.get("log").and_then(|x| x.as_str()).unwrap_or("");
-                                for l in log.lines().rev().take(5).collect::<Vec<_>>().into_iter().rev() {
-                                    if !l.trim().is_empty() {
-                                        sh2.push_log(format!("    {}", l.trim()), "dim");
-                                    }
-                                }
-                            }
-                        }
                         // 可选后端：Rust 原生 PGS 编码器结果 + 自检结论。
-                        // 与 SUPer 一样，失败只记日志、不影响「转换成功」。
+                        // 失败只记日志、不影响「转换成功」。
                         if let Some(n) = v.get("native").and_then(|x| x.as_object()) {
                             let nok = n.get("ok").and_then(|x| x.as_bool()).unwrap_or(false);
                             sh2.push_log(
@@ -677,11 +606,9 @@ fn cli_engine(args: &[String]) -> i32 {
     let mut vw = 0_u32;
     let mut vh = 0_u32;
     let mut json_out = String::new();
-    let mut super_encode = false;
     let mut native_pgs = false;
     let mut palette_fade = true;
     let mut object_split = true;
-    let mut super_cmd = String::new();
     // 对拍基准（--engine baseline）
     let mut ref_sup = String::new();
     let mut cands: Vec<(String, String)> = Vec::new();
@@ -747,14 +674,9 @@ fn cli_engine(args: &[String]) -> i32 {
                 i += 1;
                 json_out = args.get(i).cloned().unwrap_or_default();
             }
-            "--super" => super_encode = true,
             "--native-pgs" => native_pgs = true,
             "--no-palette-fade" => palette_fade = false,
             "--no-object-split" => object_split = false,
-            "--super-cmd" => {
-                i += 1;
-                super_cmd = args.get(i).cloned().unwrap_or_default();
-            }
             "--ref" => {
                 i += 1;
                 ref_sup = args.get(i).cloned().unwrap_or_default();
@@ -947,7 +869,7 @@ fn cli_engine(args: &[String]) -> i32 {
         };
     }
     if ass.is_empty() {
-        eprintln!("用法: supfast --engine analyze|convert --ass <file.ass> [--out <dir>] [--fps 23.976] [--jobs 8] [--super] [--super-cmd <path>] [--native-pgs] [--no-palette-fade] [--no-object-split]");
+        eprintln!("用法: supfast --engine analyze|convert --ass <file.ass> [--out <dir>] [--fps 23.976] [--jobs 8] [--native-pgs] [--no-palette-fade] [--no-object-split]");
         eprintln!("     supfast --engine verify --sup <file.sup> [--json <out.json>]");
         eprintln!("     supfast --engine pgs --xml <file.xml> [--out <file.sup>] [--no-palette-fade] [--no-object-split] [--json <out.json>]");
         eprintln!("     supfast --engine baseline --ref <file.sup> --cand <name>=<file.sup> [--cand ...] [--xml <bdn.xml>] [--frames <out.json>] [--png-dir <dir>] [--json <report.json>]");
@@ -956,7 +878,6 @@ fn cli_engine(args: &[String]) -> i32 {
     }
     let opts = json!({ "ass": ass, "fps": fps, "jobs": jobs, "outdir": out,
         "vfmt": "1080p", "lang": "chi", "title": "Undefined",
-        "super_encode": super_encode, "super_cmd": super_cmd,
         "native_pgs": native_pgs, "palette_fade": palette_fade, "object_split": object_split });
     match mode {
         "analyze" => match engine::analyze(&opts) {

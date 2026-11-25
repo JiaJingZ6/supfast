@@ -838,10 +838,6 @@ struct RunOpts {
     even_y: u32,
     no_sup: bool,
     dry_run: bool,
-    /// 可选后端：转换完成后用用户自备的 SUPer 把 BDN XML 重新编码成严格合规的 PGS
-    super_encode: bool,
-    /// supercli.py / 启动器路径；空则由 superenc 自动探测环境变量与常见位置
-    super_cmd: String,
     /// 可选后端：用内置的 Rust 原生 PGS 编码器整流生成 <名>.native.sup（零外部依赖）
     native_pgs: bool,
     /// 原生编码器是否启用调色板渐变（淡入淡出 / 卡拉OK）优化，默认开
@@ -899,8 +895,6 @@ fn read_opts(v: &Value) -> Result<RunOpts, String> {
         even_y: pick_u32(v, "even_y"),
         no_sup: pick_flag(v, "no_sup", false),
         dry_run: pick_flag(v, "dry_run", false),
-        super_encode: pick_flag(v, "super_encode", false),
-        super_cmd: pick_str(v, "super_cmd"),
         native_pgs: pick_flag(v, "native_pgs", false),
         palette_fade: pick_flag(v, "palette_fade", true),
         object_split: pick_flag(v, "object_split", true),
@@ -1513,31 +1507,7 @@ pub fn convert(opts: &Value, emit: Emit, cancel: Arc<AtomicBool>) -> Result<Valu
         let n_png: usize = rendered.iter().map(|r| r.graphics.len()).sum();
         let orig_times: Vec<(u32, u32)> = rendered.iter().map(|r| (r.rs, r.re)).collect();
 
-        // SUPer 要求 BDN 事件时间轴严格单调、不重叠。拼段流相邻段边界因时间码
-        // 取整会偶发 1 帧重叠（test2 有 4 处），直接喂给 SUPer 会被拒：
-        // "BDN has overlapped events. SUPer only supports monotonic timelines."
-        // 所以单独生成一份单调化副本给 SUPer 用，主 <名>.xml 保持原样 ——
-        // 可选后端不改变既有产物，也不动之前的对拍基准。
-        let mono_times: Vec<(u32, u32)> = {
-            let mut v = Vec::with_capacity(orig_times.len());
-            let mut last_out = 0u32;
-            for &(a0, b0) in &orig_times {
-                let mut a = a0;
-                let mut b = b0;
-                if a < last_out {
-                    let d = last_out - a;
-                    a += d;
-                    b += d;
-                }
-                if b <= a {
-                    b = a + 1;
-                }
-                last_out = b;
-                v.push((a, b));
-            }
-            v
-        };
-
+        // 主 <名>.xml 直接用渲染出的 InTC/OutTC；原生编码器读 XML 时自行做单调化。
         let make_bdn_xml = |times: &[(u32, u32)]| -> String {
             let first = times.first().map(|t| t.0).unwrap_or(0);
             let lastf = times.iter().map(|t| t.1).max().unwrap_or(first);
@@ -1584,14 +1554,6 @@ pub fn convert(opts: &Value, emit: Emit, cancel: Arc<AtomicBool>) -> Result<Valu
         let out_xml = outdir.join(format!("{}.xml", base));
         fs::write(&out_xml, make_bdn_xml(&orig_times))
             .map_err(|e| format!("写 XML 失败: {}", e))?;
-        let super_xml_path = if o.super_encode {
-            let p = outdir.join(format!("{}.super.xml", base));
-            fs::write(&p, make_bdn_xml(&mono_times))
-                .map_err(|e| format!("写 SUPer XML 失败: {}", e))?;
-            p
-        } else {
-            out_xml.clone()
-        };
 
         // ---------- 拼 SUP（逐段落盘，不把整条揣内存） ----------
         let mut out_sup = String::new();
@@ -1638,34 +1600,6 @@ pub fn convert(opts: &Value, emit: Emit, cancel: Arc<AtomicBool>) -> Result<Valu
             0.0
         };
 
-        // ---------- 可选后端：SUPer 把 BDN XML 重新编码成严格合规的 PGS ----------
-        // 只吃 XML + PNG，和上面拼出来的 .sup 无关，所以勾了「不生成 SUP」也能单独跑。
-        // 失败只写进返回值的 super 字段，绝不让整次转换失败（原产物已经安全落盘）。
-        let super_report = if o.super_encode {
-            emit(json!({"t":"stage","name":"super"}));
-            match crate::superenc::resolve(&o.super_cmd) {
-                Err(e) => json!({ "ok": false, "error": e }),
-                Ok(sc) => {
-                    let sup2 = outdir.join(format!("{}.super.sup", base));
-                    let mut rep =
-                        crate::superenc::encode(&sc, &super_xml_path, &sup2, cancel.as_ref());
-                    if rep.get("ok").and_then(|x| x.as_bool()).unwrap_or(false) {
-                        rep["verify"] = crate::verify::verify_sup_file(&sup2).unwrap_or_else(|e| {
-                            json!({
-                                "ok": false, "compliant": false,
-                                "errors": [{"code": "READ_FAIL", "msg": e}],
-                                "warnings": [],
-                                "lines": [{"kind": "err", "line": format!("✗ SUPer 产物自检失败：{}", e)}],
-                            })
-                        });
-                    }
-                    rep
-                }
-            }
-        } else {
-            Value::Null
-        };
-
         // ---------- 可选后端：Rust 原生 PGS 编码器（内置、零外部依赖） ----------
         // 同样只吃主 XML + PNG，但整条流一次性规划 epoch / 对象复用 / DTS，
         // 不依赖 avs2bdnxml 的 SUP 输出，也不需要 Python。产物单独落 <名>.native.sup。
@@ -1703,7 +1637,6 @@ pub fn convert(opts: &Value, emit: Emit, cancel: Arc<AtomicBool>) -> Result<Valu
             "speed": speed,
             "sup_size": sup_size,
             "verify": verify,
-            "super": super_report,
             "native": native_report,
             "events": ass.events.len(),
             "segs": segs.len(),
@@ -1722,7 +1655,7 @@ fn xml_esc(s: &str) -> String {
 // 环境自检
 // ---------------------------------------------------------------------------
 
-pub fn probe_env(mod_root: Option<&str>, super_cmd: &str) -> Value {
+pub fn probe_env(mod_root: Option<&str>) -> Value {
     let o = RunOpts {
         ass: PathBuf::new(),
         fps: 23.976,
@@ -1741,8 +1674,6 @@ pub fn probe_env(mod_root: Option<&str>, super_cmd: &str) -> Value {
         even_y: 0,
         no_sup: false,
         dry_run: false,
-        super_encode: false,
-        super_cmd: String::new(),
         native_pgs: false,
         palette_fade: true,
         object_split: true,
@@ -1765,9 +1696,6 @@ pub fn probe_env(mod_root: Option<&str>, super_cmd: &str) -> Value {
         }
     }
 
-    // SUPer 是可选后端，找不到不算环境缺失：key 不进 UI 的 bad 列表。
-    let (super_ok, super_detail) = crate::superenc::probe(super_cmd);
-
     json!({
         "mod_dir": dir_s,
         "items": [
@@ -1778,13 +1706,7 @@ pub fn probe_env(mod_root: Option<&str>, super_cmd: &str) -> Value {
             {"key":"avisynth","name":"AviSynth","ok":!avs.is_empty(),
              "detail": if avs.is_empty() { "未安装 AviSynth".to_string() } else { format!("{}（32 位）", avs) }},
             {"key":"runtime","name":"WebView2 运行时","ok":true,"detail":"Tauri 2 + WebView2（系统自带）"},
-            {"key":"engine","name":"内置引擎","ok":true,"detail":"Rust 原生实现（无需 Python / Node）"},
-            {"key":"super","name":"SUPer 重编码（可选）","ok":super_ok,
-             "detail": if super_ok {
-                 format!("{}（外部调用，不随包分发）", super_detail)
-             } else {
-                 format!("{}（可选；需自行安装 GPL-3.0 的 SUPer）", super_detail)
-             }},
+            {"key":"engine","name":"内置引擎","ok":true,"detail":"Rust 原生实现（无需 Python / Node）"}
         ],
     })
 }
