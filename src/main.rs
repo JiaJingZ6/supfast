@@ -8,6 +8,8 @@ mod engine;
 mod verify;
 mod superenc;
 mod pgs;
+mod pgsdec;
+mod baseline;
 
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
@@ -678,6 +680,15 @@ fn cli_engine(args: &[String]) -> i32 {
     let mut palette_fade = true;
     let mut object_split = true;
     let mut super_cmd = String::new();
+    // 对拍基准（--engine baseline）
+    let mut ref_sup = String::new();
+    let mut cands: Vec<(String, String)> = Vec::new();
+    let mut tol_frames = 1_u32;
+    let mut color_tol = 2_u8;
+    let mut ratio_tol = 0.005_f64;
+    let mut frames_out = String::new();
+    let mut png_dir = String::new();
+    let mut max_png = 64_usize;
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
@@ -685,6 +696,7 @@ fn cli_engine(args: &[String]) -> i32 {
             "convert" => mode = "convert",
             "verify" => mode = "verify",
             "pgs" => mode = "pgs",
+            "baseline" => mode = "baseline",
             "--ass" => {
                 i += 1;
                 ass = args.get(i).cloned().unwrap_or_default();
@@ -729,9 +741,86 @@ fn cli_engine(args: &[String]) -> i32 {
                 i += 1;
                 super_cmd = args.get(i).cloned().unwrap_or_default();
             }
+            "--ref" => {
+                i += 1;
+                ref_sup = args.get(i).cloned().unwrap_or_default();
+            }
+            "--cand" => {
+                i += 1;
+                let v = args.get(i).cloned().unwrap_or_default();
+                if !v.is_empty() {
+                    // 支持 name=path；不带名字就用文件名当名字
+                    let (n, p) = match v.split_once('=') {
+                        Some((n, p)) if !n.is_empty() && !p.is_empty() => (n.to_string(), p.to_string()),
+                        _ => {
+                            let n = Path::new(&v)
+                                .file_stem()
+                                .map(|s| s.to_string_lossy().to_string())
+                                .unwrap_or_else(|| format!("cand{}", cands.len() + 1));
+                            (n, v)
+                        }
+                    };
+                    cands.push((n, p));
+                }
+            }
+            "--tol" => {
+                i += 1;
+                tol_frames = args.get(i).and_then(|s| s.parse().ok()).unwrap_or(1);
+            }
+            "--color-tol" => {
+                i += 1;
+                color_tol = args.get(i).and_then(|s| s.parse().ok()).unwrap_or(2);
+            }
+            "--ratio-tol" => {
+                i += 1;
+                ratio_tol = args.get(i).and_then(|s| s.parse().ok()).unwrap_or(0.005);
+            }
+            "--frames" => {
+                i += 1;
+                frames_out = args.get(i).cloned().unwrap_or_default();
+            }
+            "--png-dir" => {
+                i += 1;
+                png_dir = args.get(i).cloned().unwrap_or_default();
+            }
+            "--max-png" => {
+                i += 1;
+                max_png = args.get(i).and_then(|s| s.parse().ok()).unwrap_or(64);
+            }
             _ => {}
         }
         i += 1;
+    }
+    if mode == "baseline" {
+        if ref_sup.is_empty() || cands.is_empty() {
+            eprintln!("用法: supfast --engine baseline --ref <file.sup> --cand <name>=<file.sup> [--cand ...] [--xml <bdn.xml>] [--fps 23.976] [--tol 1] [--color-tol 2] [--frames <out.json>] [--png-dir <dir>] [--max-png 64] [--json <report.json>]");
+            return 2;
+        }
+        let opts = baseline::Options {
+            reference: PathBuf::from(&ref_sup),
+            candidates: cands
+                .iter()
+                .map(|(n, p)| baseline::Candidate { name: n.clone(), path: PathBuf::from(p) })
+                .collect(),
+            xml: if xml.is_empty() { None } else { Some(PathBuf::from(&xml)) },
+            fps,
+            tol_frames,
+            color_tol,
+            ratio_tol,
+            frames_out: if frames_out.is_empty() { None } else { Some(PathBuf::from(&frames_out)) },
+            png_dir: if png_dir.is_empty() { None } else { Some(PathBuf::from(&png_dir)) },
+            max_png,
+        };
+        return match baseline::run(&opts) {
+            Ok(v) => {
+                emit_json(&serde_json::to_string_pretty(&v).unwrap(), &json_out);
+                0
+            }
+            Err(e) => {
+                eprintln!("对拍基准失败: {}", e);
+                1
+            }
+        };
     }
     if mode == "verify" {
         if sup.is_empty() {
@@ -780,6 +869,7 @@ fn cli_engine(args: &[String]) -> i32 {
         eprintln!("用法: supfast --engine analyze|convert --ass <file.ass> [--out <dir>] [--fps 23.976] [--jobs 8] [--super] [--super-cmd <path>] [--native-pgs] [--no-palette-fade] [--no-object-split]");
         eprintln!("     supfast --engine verify --sup <file.sup> [--json <out.json>]");
         eprintln!("     supfast --engine pgs --xml <file.xml> [--out <file.sup>] [--no-palette-fade] [--no-object-split] [--json <out.json>]");
+        eprintln!("     supfast --engine baseline --ref <file.sup> --cand <name>=<file.sup> [--cand ...] [--xml <bdn.xml>] [--frames <out.json>] [--png-dir <dir>] [--json <report.json>]");
         return 2;
     }
     let opts = json!({ "ass": ass, "fps": fps, "jobs": jobs, "outdir": out,

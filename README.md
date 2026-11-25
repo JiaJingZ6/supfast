@@ -241,6 +241,87 @@ ODS（DTS 更早）之间就造成段 DTS 回退。现在按 `ref.sup` 的排布
 超 RX 缓冲的流 —— 常规字幕用不到，全屏大图需要注意。输入 PNG 的颜色数也应 ≤255：
 PGS 要求 palette entry `0xFF` 是全透明保留项，若被用作可见色会直接报错而不是产出坏流。
 
+## 真机播放验证前置：对拍基准
+
+真机 / 硬解播放验证没法自动化，所以先做一版可复现的**软基准**：自带一个 PGS 软件
+解码器（`src/pgsdec.rs`）按 HDMV PGS 解码器模型把任意 `.sup` 还原成
+「显示集 PTS → 屏幕画面」，`src/baseline.rs` 在此基础上对拍，并导出**黄金帧清单**
+与**参考画面 PNG**。真机上录屏抽帧后，直接拿这份基准对照即可。
+
+| 三角 | 谁和谁比 | 由谁做 |
+|---|---|---|
+| ① 源头对拍 | 源 PNG（BDN ground truth） ↔ SUP 解码画面 | `--xml`，按事件序号对齐 |
+| ② 跨流对拍 | 参考流 ↔ 任意多条候选流 | `--ref` + 多个 `--cand` |
+| ③ 真机对拍 | 播放器输出 ↔ 黄金帧清单 / 参考画面 | 人工录屏抽帧，本工具提供对照物 |
+
+跨流对拍分两条轨道，避免把「时间轴平移」误判成「画面编错」：
+
+| 轨 | 做法 | 回答 |
+|---|---|---|
+| 内容 | 可见帧按序号对齐，hash 不同的帧二次解码逐像素比对 | 每张图有没有被编对 |
+| 时间轴 | 两流所有 PTS 的并集上采样，取各自「最后一个 `pts ≤ t`」的帧比 hash | 同一时刻挂着哪张画面 |
+
+时间轴轨把 hash 不同再分三类：`presence`（一方已清屏）、`color_only`（像素集合与
+bbox 完全相同，只是 ±1 的 YCbCr 舍入）、`frame_mismatch`（真错位）。只有后两类中的
+真实错位 / 存在性差异 / 按序号的 PTS 平移才算「时间轴不一致」。比对在 PGS 原生
+`[Y, Cr, Cb, Alpha]` 域进行，不做 YCbCr→RGB 往返；透明像素的 RGB 不参与比较。
+二次解码只对 hash 不同的帧、按 256 帧分块，内存 O(一帧)。
+
+| 结论 | 含义 |
+|---|---|
+| `identical` | 内容轨与时间轴轨都完全一致 |
+| `equivalent` | 内容轨只差 `--color-tol` 内（默认 2，工具链间 ±1 舍入），时间轴一致 |
+| `content_ok_time_shift` | 每帧画面无损，但两流 PTS 有平移或清屏时机不同 —— **真机验证重点** |
+| `divergent` | 内容帧有超过容差的实质差异，看 `content.worst` 定位 |
+
+```bat
+:: 一键跑四组样本（不重渲染，直接用 test\ 下已有 SUP + XML + PNG）
+tools\baseline.bat
+:: 或单独对拍两条已有 SUP
+supfast.exe --engine baseline --ref test2.sup --cand native=test2.native.sup ^
+  --cand ref=ref.sup --xml test2.xml --frames frames.json --png-dir frames ^
+  --json baseline.json
+```
+
+`--cand` 可重复，格式 `名字=路径`（省略名字就用文件名）。其余参数：`--fps`（默认
+23.976）、`--tol`（时间轴容差帧数，默认 1）、`--color-tol`（逐通道容差，默认 2）、
+`--ratio-tol`（超容差像素占比上限，默认 0.005）、`--frames`（黄金帧清单 JSON）、
+`--png-dir` + `--max-png`（导出 bbox 裁出的 RGBA 参考画面）、`--json`（完整报告）。
+一键脚本的结果落在 `tools\baseline-results\`：`<时间戳>_<样本>.json`、
+`<时间戳>_<样本>.frames.json`、`<时间戳>_<样本>.png\`，以及 `<时间戳>_summary.md`。
+
+报告里 `reference` / `streams` 给每条流的体积、显示集数、帧数、epoch 数与合规自检
+简报；`pairs[]` 分 `content` / `timeline` 两段；`source.checks[]` 是源头对拍；
+`golden.frames[]` 每帧含 PTS、帧号、hash、bbox、不透明像素数与参考 PNG 名。
+
+实测（2026-11-25，四组样本 / 9 条候选，整轮约 121 秒）：
+
+| 样本 | 参考 → 候选 | 内容轨 | 时间轴轨 | 综合 | 源头对拍 |
+|---|---|---|---|---|---|
+| fade | 渐变关 → 渐变开 / 最终 | 8/8 帧一致 | identical | `identical` | 8/8 逐像素一致，Δ=0 |
+| split | 拆分关 → 拆分开 / 最终 | 8/8 帧一致 | identical | `identical` | 8/8 逐像素一致，Δ=0 |
+| test2 | 拼段 → 原生最终 | 129 帧：73 全一致 + 56 帧 Δ=1，**0 实质差异** | shifted，PTS 偏移最大 108847 tick | `content_ok_time_shift` | 原生 129/129 逐像素一致（Δ=0、PTS 差 0） |
+| test2 | 拼段 → avs2bdnxml 原版 | 129/129 完全一致 | shifted | `content_ok_time_shift` | 73/129 完全一致（56 帧 Δ=1） |
+| drama | 拼段 → 原生最终 | 1832 帧：3 全一致 + 1829 帧 Δ=1，**0 实质差异** | shifted，PTS 偏移最大 562 tick | `content_ok_time_shift` | 原生 1832/1832 逐像素一致（Δ=0、PTS 差 0） |
+
+三条结论：
+
+- **画面无损**：原生整流流（含调色板渐变、帧间对象拆分）与源 PNG 逐像素一致；
+  与拼段流的唯一差异是 ±1 的 RGB→YCbCr 舍入（两套矩阵/取整口径），PSNR ≈ 77 dB。
+  fade / split 合成样本两轨全 `identical`，说明两条优化链在解码器模型下与逐帧 ODS
+  完全等价 —— 不再是「只拿源 PNG 自证」，而是跨编码策略的独立验证。
+- **时间轴口径不同**：`sup_retime` 按段单调化，原生编码器按 BDN `InTC` 规划
+  （`mono_times`），拼段流还少补清屏显示集。源头对拍里原生流与源 PTS 差为 0，
+  拼段流 `test2` 最大偏 1.21 秒、`drama` 最大偏 562 tick。报告里的
+  `timeline.mismatch_intervals` 逐段列出差异区间，就是真机上该重点复核的时间点。
+- **基准可复现**：脚本不重新渲染字幕，直接用已有 SUP + XML + PNG，换机器、换提交
+  都能重跑对比。
+
+第一版的已知简化：解码器不按 WDS 窗口裁像素、不处理 `cropped` 对象偏移（同一 BDN
+来源的对象都落在窗口内，不影响结论，窗口定义仍解析统计）；源头对拍按事件序号对齐，
+PTS 差只作参考；导出的参考 PNG 是标准 BT.709/601 反变换的 8bit RGBA，仅供人眼 /
+录屏对照，不参与判据。
+
 ## SUPer 高质量 PGS（可选）
 
 `cubicibo/SUPer`（GPL-3.0-or-later）是完整的 HDMV PGS 编码器，吃 BDN XML + PNG，
@@ -301,6 +382,10 @@ supfast.exe --engine pgs --xml test2.xml --out test2.native.sup --vw 1920 --vh 1
 :: 关掉调色板渐变 / 帧间对象拆分做对照（--engine convert --native-pgs 同样支持）
 supfast.exe --engine pgs --xml test2.xml --out test2.nofade.sup --no-palette-fade --json pgs.json
 supfast.exe --engine pgs --xml test2.xml --out test2.nosplit.sup --no-object-split --json pgs.json
+:: 对拍基准：参考流 vs 候选流 + 源 PNG 对拍 + 黄金帧清单（详见上一节）
+supfast.exe --engine baseline --ref test2.sup --cand native=test2.native.sup --xml test2.xml --frames frames.json --json baseline.json
+:: 或一键跑四组样本
+tools\baseline.bat
 ```
 
 - `analyze` 输出 events / frames / segs / sta / dyn / work / ratio / w / h，以及 `bands`（全片时间轴）与 `timeline`。
@@ -320,6 +405,10 @@ supfast.exe --engine pgs --xml test2.xml --out test2.nosplit.sup --no-object-spl
   `--no-object-split` 关闭帧间对象拆分。`verify` 的 `stats` 里另有 `palette_updates` /
   `pu_cobj_changed` / `pu_pds_version_bad` / `multi_obj_ds` / `max_cobjs` / `cobj_dup` /
   `cobj_too_many`。
+- `baseline` 输出 `reference` / `streams`（流级统计 + 合规简报）、`golden`（黄金帧清单）、
+  `pairs[]`（`content` 内容轨 + `timeline` 时间轴轨）、`source.checks[]`（源头对拍）、
+  `summary.lines`。`content.worst` 列差异最大的帧，`timeline.mismatch_intervals` 列
+  真机该重点复核的时间段；`--cand` 可重复，格式 `名字=路径`。
 
 ## 编译
 
@@ -332,7 +421,7 @@ supfast.exe --engine pgs --xml test2.xml --out test2.nosplit.sup --no-object-spl
 
 ```
 dist\
-├─ supfast.exe            4.1 MB
+├─ supfast.exe            4.2 MB
 ├─ WebView2Loader.dll     157 KB   gnu 目标是动态加载 WebView2，必须带
 └─ mod\                   3.4 MB   avs2bdnxml.exe + csri\VSFilterMod.dll
 ```
@@ -347,10 +436,13 @@ dist\
 ├─ icons\icon.ico              4 根竖条，最后一根是强调橙（make_icon.py 生成）
 ├─ src\engine.rs               引擎：解析 → 切段 → 并行渲染 → 重写 XML / SUP
 ├─ src\pgs.rs                  原生 PGS 编码器：PNG/RLE → epoch 规划 → 调色板渐变 / 帧间对象拆分 → 段序列化
+├─ src\pgsdec.rs               PGS 软件解码器（播放器模型）：SUP → 时间轴画面，对拍基准用
+├─ src\baseline.rs             对拍基准：内容轨 / 时间轴轨 + 黄金帧清单 / 参考画面导出
 ├─ src\verify.rs               SUP 合规自检（零依赖，含 palette update / 多对象显示集检查）
 ├─ src\superenc.rs             可选 SUPer 外部调用
 ├─ src\main.rs                 IPC 路由 + 状态持久化 + 命令行入口
 ├─ ui\index.html               界面（单文件 HTML + CSS + JS）
+├─ tools\baseline.bat / .ps1   一键跑四组样本的对拍基准（结果进 tools\baseline-results\）
 ├─ tools\gcc_shim.rs           windres 用的最小 gcc -E 垫片（见下）
 ├─ tools\winbox.rs             开发用：从外部改窗口尺寸，方便截图核对排版
 └─ build.bat                   一键编译 + 组装 dist\
@@ -473,3 +565,7 @@ tools\winbox.exe min "Google Chrome"    :: 截图前把挡在前面的窗口最�
 - 右键菜单是关掉的：WebView2 默认会弹「重新加载 / 另存为 / 打印 / 检查」，
   这里用 `SetAreDefaultContextMenusEnabled(false)` 关掉，页面再兜一层 `contextmenu`。
   代价是输入框里右键粘贴没了，`Ctrl+V` 照常可用。
+- **对拍基准只是软解码模型**：`src/pgsdec.rs` 第一版不按 WDS 窗口裁像素、不处理
+  `cropped` 对象偏移，也不模拟硬件解码器的 display set buffering 与实际擦除时间。
+  它验证「同一时刻屏幕上的像素是否一致」，不能替代真机 / 硬解播放验证；真机结论
+  仍需拿黄金帧清单与参考画面录屏核对（见 [对拍基准](#真机播放验证前置对拍基准)）。

@@ -1635,6 +1635,62 @@ pub fn encode(
     }))
 }
 
+// ---------------------------------------------------------------------------
+// 对拍基准：把 BDN XML + 索引 PNG 还原成「事件 → 期望画面」
+// ---------------------------------------------------------------------------
+
+/// 与 `pgsdec` 解码出的帧同域（YCbCr + alpha 的稀疏像素），供
+/// `--engine baseline --xml` 做源头对拍。返回 (视频宽, 视频高, fps, 帧列表)。
+pub struct SrcFrame {
+    /// BDN 事件起点换算的 PTS（90 kHz）
+    pub pts: u32,
+    /// (y * 视频宽 + x, [Y, Cr, Cb, A])，只含 alpha>0 的像素，按 key 升序
+    pub px: Vec<(u32, [u8; 4])>,
+}
+
+pub fn source_frames(xml: &Path) -> Result<(u32, u32, f64, Vec<SrcFrame>), String> {
+    let bdn = parse_bdn(xml)?;
+    let (vw, vh) = video_size(&bdn.vfmt);
+    let bt709 = vh >= 720;
+    let dir = xml.parent().unwrap_or_else(|| Path::new("."));
+    let times = mono_times(&bdn);
+    let mut out: Vec<SrcFrame> = Vec::with_capacity(bdn.events.len());
+    for (i, ev) in bdn.events.iter().enumerate() {
+        let mut px: Vec<(u32, [u8; 4])> = Vec::new();
+        for g in &ev.gs {
+            let png = decode_png(&dir.join(&g.file))?;
+            let pal = palette_entries(&png.plte, &png.trns, bt709);
+            for py in 0..png.h {
+                let yy = g.y.saturating_add(py);
+                if yy >= vh {
+                    break;
+                }
+                for pxx in 0..png.w {
+                    let xx = g.x.saturating_add(pxx);
+                    if xx >= vw {
+                        continue;
+                    }
+                    let e = png.idx.get((py * png.w + pxx) as usize).copied().unwrap_or(0) as usize;
+                    let entry = match pal.get(e) {
+                        Some(v) => v,
+                        None => continue,
+                    };
+                    if entry[4] == 0 {
+                        continue;
+                    }
+                    px.push((yy * vw + xx, [entry[1], entry[2], entry[3], entry[4]]));
+                }
+            }
+        }
+        px.sort_by_key(|p| p.0);
+        px.reverse();
+        px.dedup_by_key(|p| p.0);
+        px.reverse();
+        out.push(SrcFrame { pts: ticks(times[i].0, bdn.fps), px });
+    }
+    Ok((vw, vh, bdn.fps, out))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
