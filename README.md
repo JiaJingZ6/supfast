@@ -505,7 +505,7 @@ Windows 会为**每一段的每个子进程**分配 conhost —— 整片 1832 �
 
 ```bat
 build.bat          :: 先编译出 dist\
-pack-release.bat   :: 产出 release\supfast-1.0.1-win64.zip（约 3.1 MB）
+pack-release.bat   :: 产出 release\supfast-1.0.2-win64.zip（约 3.3 MB）
 ```
 
 解压后是一个自成一体的目录：`supfast.exe`、`WebView2Loader.dll`、`mod\`，以及给最终用户的 `README.txt`

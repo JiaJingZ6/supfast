@@ -1,6 +1,6 @@
 [package]
 name = "supfast"
-version = "1.0.1"
+version = "1.0.2"
 edition = "2021"
 description = "supfast — ASS 字幕转 PGS，只渲染必要的帧"
 

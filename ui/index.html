@@ -1475,7 +1475,7 @@ addEventListener('contextmenu', (e) => { e.preventDefault(); e.stopPropagation()
 async function boot(){
   const st = await rpc('/api/boot');
   applyTheme((st.settings && st.settings.theme) || 'auto', false);
-  $('#ftUrl').textContent = `v${st.version || '1.0.1'} · Tauri ${st.tauri || '2'}`;
+  $('#ftUrl').textContent = `v${st.version || '1.0.2'} · Tauri ${st.tauri || '2'}`;
   S.env = st.env || []; S.modDir = st.mod_dir || '';
   S.recent = st.recent || []; S.history = st.history || [];
   applySettings(st.settings);

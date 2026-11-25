@@ -494,7 +494,7 @@ DOM 表单  ──readForm()──►  {ass, fps, vfmt, lang, title, jobs, outdi
 ```json
 {
   "productName": "supfast",
-  "version": "1.0.1",
+  "version": "1.0.2",
   "identifier": "com.supfast.desktop",
   "build": { "frontendDist": "ui" },
   "app": {
@@ -551,7 +551,7 @@ Tauri 2 的权限白名单，作用于 `main` 窗口：
 
 [pack-release.bat](file:///H:/DIY/rea_sup/tauri/pack-release.bat)：
 
-1. `VER=1.0.1`（发版改这里）→ 临时 staging 目录。
+1. `VER=1.0.2`（发版改这里）→ 临时 staging 目录。
 2. `xcopy dist\*` + `packaging\release-readme.txt` → `README.txt`。
 3. **防呆**：staging 里若出现 `state.json` 直接失败（用户状态绝不能进包）。
 4. `Compress-Archive` → `release\supfast-<ver>-win64.zip`。
@@ -562,7 +562,7 @@ Tauri 2 的权限白名单，作用于 `main` 窗口：
 
 [.github/workflows/release.yml](file:///H:/DIY/rea_sup/tauri/.github/workflows/release.yml)：push `v*` tag（或手动 `workflow_dispatch` 填 tag）→ 校验 `packaging/artifacts/` **正好一个** zip → 有 `packaging/release-notes-<ver>.md` 就用它当正文，否则自动生成 → `gh release upload --clobber`。
 
-`mod\` 的二进制在 runner 上编不出来，所以 zip 随仓库走（每个版本一份，记得删旧的）。当前仓库里是 `packaging\artifacts\supfast-1.0.1-win64.zip`。
+`mod\` 的二进制在 runner 上编不出来，所以 zip 随仓库走（每个版本一份，记得删旧的）。当前仓库里是 `packaging\artifacts\supfast-1.0.2-win64.zip`。
 
 ---
 
