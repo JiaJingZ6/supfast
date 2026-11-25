@@ -243,44 +243,53 @@ PGS 要求 palette entry `0xFF` 是全透明保留项，若被用作可见色会
 
 ## 真机播放验证前置：对拍基准
 
-真机 / 硬解播放验证没法自动化，所以先做一版可复现的**软基准**：自带一个 PGS 软件
-解码器（`src/pgsdec.rs`）按 HDMV PGS 解码器模型把任意 `.sup` 还原成
-「显示集 PTS → 屏幕画面」，`src/baseline.rs` 在此基础上对拍，并导出**黄金帧清单**
-与**参考画面 PNG**。真机上录屏抽帧后，直接拿这份基准对照即可。
+真机 / 硬解播放验证没法自动化，所以先把「播放器模型」下的等价性做成可复现的
+**软基准**（第二版已补上硬解缓冲模型），再把第三角做成可复现的录屏对照命令。
 
 | 三角 | 谁和谁比 | 由谁做 |
 |---|---|---|
 | ① 源头对拍 | 源 PNG（BDN ground truth） ↔ SUP 解码画面 | `--xml`，按事件序号对齐 |
 | ② 跨流对拍 | 参考流 ↔ 任意多条候选流 | `--ref` + 多个 `--cand` |
-| ③ 真机对拍 | 播放器输出 ↔ 黄金帧清单 / 参考画面 | 人工录屏抽帧，本工具提供对照物 |
+| ③ 真机对拍 | 播放器录屏 ↔ 黄金帧清单 / 参考画面 | `--engine compare`，ffmpeg 抽帧逐像素比对 |
+
+`src/pgsdec.rs` 按 HDMV PGS 解码器模型把任意 `.sup` 还原成「显示集 PTS → 屏幕画面」：
+Epoch Start 清状态、ODS 分片 + RLE、PDS 累积 / palette update、多对象合成、清屏帧，
+并按 **WDS 窗口裁剪** 与 `object_cropped_flag` 处理对象内裁剪（变长 cobj 解析）。
+第二版再加一层硬解时序：段按 DTS 进 RX buffer，RLE 解码受 `Rd=16e6 px/s`、
+清屏 / 窗口合成受 `Rc=32e6 px/s` 限制，得 `present_pts = max(pts, dts + need)`；
+同时统计 RX buffer 1 MiB / object buffer 4 MiB 峰值。`src/baseline.rs` 做双轨对拍并
+导出黄金帧清单 + 参考画面 PNG；`src/compare.rs` 拿录屏按 `present_pts` 抽帧比对。
 
 跨流对拍分两条轨道，避免把「时间轴平移」误判成「画面编错」：
 
 | 轨 | 做法 | 回答 |
 |---|---|---|
 | 内容 | 可见帧按序号对齐，hash 不同的帧二次解码逐像素比对 | 每张图有没有被编对 |
-| 时间轴 | 两流所有 PTS 的并集上采样，取各自「最后一个 `pts ≤ t`」的帧比 hash | 同一时刻挂着哪张画面 |
+| 时间轴（名义） | 两流所有 PTS 的并集上采样，取各自「最后一个 `pts ≤ t`」的帧比 hash | 同一时刻挂着哪张画面 |
+| 时间轴（有效） | 同上但改用 `present_pts`（late 帧会被推后） | 硬解真正来得及呈现的画面 |
 
 时间轴轨把 hash 不同再分三类：`presence`（一方已清屏）、`color_only`（像素集合与
-bbox 完全相同，只是 ±1 的 YCbCr 舍入）、`frame_mismatch`（真错位）。只有后两类中的
-真实错位 / 存在性差异 / 按序号的 PTS 平移才算「时间轴不一致」。比对在 PGS 原生
+bbox 完全相同，只是 ±1 的 YCbCr 舍入）、`frame_mismatch`（真错位）。比对在 PGS 原生
 `[Y, Cr, Cb, Alpha]` 域进行，不做 YCbCr→RGB 往返；透明像素的 RGB 不参与比较。
 二次解码只对 hash 不同的帧、按 256 帧分块，内存 O(一帧)。
 
 | 结论 | 含义 |
 |---|---|
-| `identical` | 内容轨与时间轴轨都完全一致 |
+| `identical` | 内容轨与两条时间轴轨都完全一致，且解码可行 |
 | `equivalent` | 内容轨只差 `--color-tol` 内（默认 2，工具链间 ±1 舍入），时间轴一致 |
 | `content_ok_time_shift` | 每帧画面无损，但两流 PTS 有平移或清屏时机不同 —— **真机验证重点** |
+| `decode_risk` | 任一流有 late 显示集（`dts + need > pts`）或 RX / object buffer 超限；名义时间轴已不足以描述真机，看 `timeline.decode` / `timeline.effective` |
 | `divergent` | 内容帧有超过容差的实质差异，看 `content.worst` 定位 |
 
 ```bat
-:: 一键跑四组样本（不重渲染，直接用 test\ 下已有 SUP + XML + PNG）
+:: ①② 一键跑四组样本（不重渲染，直接用 test\ 下已有 SUP + XML + PNG）
 tools\baseline.bat
-:: 或单独对拍两条已有 SUP
+:: 单独对拍两条已有 SUP
 supfast.exe --engine baseline --ref test2.sup --cand native=test2.native.sup ^
   --cand ref=ref.sup --xml test2.xml --frames frames.json --png-dir frames ^
   --json baseline.json
+:: ③ 拿录屏对照（frames.json 里已记录参考 PNG 目录）
+tools\compare_recording.bat -Frames frames.json -Recording rec.mp4 -OffsetMs 1001
 ```
 
 `--cand` 可重复，格式 `名字=路径`（省略名字就用文件名）。其余参数：`--fps`（默认
@@ -290,37 +299,66 @@ supfast.exe --engine baseline --ref test2.sup --cand native=test2.native.sup ^
 一键脚本的结果落在 `tools\baseline-results\`：`<时间戳>_<样本>.json`、
 `<时间戳>_<样本>.frames.json`、`<时间戳>_<样本>.png\`，以及 `<时间戳>_summary.md`。
 
-报告里 `reference` / `streams` 给每条流的体积、显示集数、帧数、epoch 数与合规自检
-简报；`pairs[]` 分 `content` / `timeline` 两段；`source.checks[]` 是源头对拍；
-`golden.frames[]` 每帧含 PTS、帧号、hash、bbox、不透明像素数与参考 PNG 名。
+`compare` 的参数：`--frames`（帧清单）、`--recording`（录屏，ffmpeg 能读的任何格式）、
+`--ffmpeg`（默认自动探测 PATH / `H:/ffmpeg/bin`）、`--offset-ms`（录屏起点相对 SUP
+PTS 0 的毫秒偏移，用来对齐播放器起始时间）、`--cmp-tol`（逐通道容差，默认 12）、
+`--cmp-ratio-tol`（超容差占比上限，默认 0.02）、`--shrink`（bbox 内缩像素，默认 1，
+跳过抗锯齿边缘）、`--min-alpha`（默认 200，跳过半透明边缘）、`--nominal`（改用名义
+PTS 抽帧）、`--max-frames`（0 = 全部）、`--shots-dir`（导出录屏裁图与差异热图）、
+`--json`。结果落 `tools\compare-results\`，含 JSON 判定、Markdown 摘要、每帧
+`*.shot.png` 与 `*.diff.png`（红越亮代表通道差越大）。
 
-实测（2026-11-25，四组样本 / 9 条候选，整轮约 121 秒）：
+报告里 `reference` / `streams` 给每条流的体积、显示集数、帧数、epoch 数、合规自检
+简报，以及 `clip`（窗口裁剪 / cropped 统计）与 `decode`（late 显示集、RX 峰值、
+DTS 单调性）；`pairs[]` 分 `content` / `timeline` 两段，`timeline` 内另有 `decode`
+与 `effective`（基于 `present_pts` 的有效时间轴）；`source.checks[]` 是源头对拍；
+`golden.frames[]` 每帧含 PTS、`present_pts`、`late_ticks`、hash、bbox 与参考 PNG 名。
 
-| 样本 | 参考 → 候选 | 内容轨 | 时间轴轨 | 综合 | 源头对拍 |
-|---|---|---|---|---|---|
-| fade | 渐变关 → 渐变开 / 最终 | 8/8 帧一致 | identical | `identical` | 8/8 逐像素一致，Δ=0 |
-| split | 拆分关 → 拆分开 / 最终 | 8/8 帧一致 | identical | `identical` | 8/8 逐像素一致，Δ=0 |
-| test2 | 拼段 → 原生最终 | 129 帧：73 全一致 + 56 帧 Δ=1，**0 实质差异** | shifted，PTS 偏移最大 108847 tick | `content_ok_time_shift` | 原生 129/129 逐像素一致（Δ=0、PTS 差 0） |
-| test2 | 拼段 → avs2bdnxml 原版 | 129/129 完全一致 | shifted | `content_ok_time_shift` | 73/129 完全一致（56 帧 Δ=1） |
-| drama | 拼段 → 原生最终 | 1832 帧：3 全一致 + 1829 帧 Δ=1，**0 实质差异** | shifted，PTS 偏移最大 562 tick | `content_ok_time_shift` | 原生 1832/1832 逐像素一致（Δ=0、PTS 差 0） |
+实测（2026-11-25，第二版，四组样本 / 9 条候选，整轮约 129 秒）：
 
-三条结论：
+| 样本 | 参考 → 候选 | 内容轨 | 名义 / 有效时间轴 | late 显示集（ref / cand） | 综合 | 源头对拍 |
+|---|---|---|---|---|---|---|
+| fade | 渐变关 → 渐变开 / 最终 | 8/8 帧一致 | identical / identical | 0 / 0 | `identical` | 8/8 逐像素一致，Δ=0 |
+| split | 拆分关 → 拆分开 / 最终 | 8/8 帧一致 | identical / identical | 0 / 0 | `identical` | 8/8 逐像素一致，Δ=0 |
+| test2 | 拼段 → 原生最终 / 阶段一 | 129 帧：73 全一致 + 56 帧 Δ=1，**0 实质差异** | shifted / shifted | 174 / 0 | `decode_risk` | 原生 129/129 逐像素一致（Δ=0、PTS 差 0） |
+| test2 | 拼段 → avs2bdnxml 原版 | 129/129 完全一致 | shifted / shifted | 174 / 64 | `decode_risk` | 73/129 完全一致（56 帧 Δ=1） |
+| drama | 拼段 → 原生最终 / 阶段一 | 1832 帧：3 全一致 + 1829 帧 Δ=1，**0 实质差异** | shifted / shifted | 2430 / 1 或 0 | `decode_risk` | 原生 1832/1832 逐像素一致（Δ=0、PTS 差 0） |
+
+四条结论：
 
 - **画面无损**：原生整流流（含调色板渐变、帧间对象拆分）与源 PNG 逐像素一致；
-  与拼段流的唯一差异是 ±1 的 RGB→YCbCr 舍入（两套矩阵/取整口径），PSNR ≈ 77 dB。
-  fade / split 合成样本两轨全 `identical`，说明两条优化链在解码器模型下与逐帧 ODS
-  完全等价 —— 不再是「只拿源 PNG 自证」，而是跨编码策略的独立验证。
+  与拼段流的唯一差异是 ±1 的 RGB→YCbCr 舍入（两套矩阵 / 取整口径），PSNR ≈ 77 dB。
+  fade / split 合成样本两条时间轴全 `identical`，说明两条优化链在解码器模型下与
+  逐帧 ODS 完全等价 —— 不是「只拿源 PNG 自证」，而是跨编码策略的独立验证。
+- **解码可行性分化（第二版新发现）**：参考流是旧拼段产物，实测 **所有 PCS 的
+  `DTS = PTS`（lead=0）**，PDS 带 `0xFFFF…` 哨兵 PTS、`DTS=0`，因此 test2 的
+  174 个、drama 的 2430 个显示集在硬解模型下全都来不及解码（最大 late 954 /
+  1879 tick）；原生整流流统一 `lead=9587`、PDS/END 用 `base`，late 为 0
+  （drama 最终版有 1 个显示集余量不足，阶段一为 0，是后续可优化点）。
+  avs2bdnxml 原版介于两者之间（test2 有 64 个 late）。这比 PTS 平移严重得多，
+  也是「原生实现可取代外部 SUPer 后端 / 设为默认」的一条硬证据。
 - **时间轴口径不同**：`sup_retime` 按段单调化，原生编码器按 BDN `InTC` 规划
   （`mono_times`），拼段流还少补清屏显示集。源头对拍里原生流与源 PTS 差为 0，
-  拼段流 `test2` 最大偏 1.21 秒、`drama` 最大偏 562 tick。报告里的
-  `timeline.mismatch_intervals` 逐段列出差异区间，就是真机上该重点复核的时间点。
-- **基准可复现**：脚本不重新渲染字幕，直接用已有 SUP + XML + PNG，换机器、换提交
-  都能重跑对比。
+  拼段流 `test2` 最大偏 1.21 秒、`drama` 最大偏 562 tick。有效时间轴轨与名义轨
+  结论一致（都 `shifted`），说明这不是解码来不及造成的假象，而是真实的规划差异；
+  `timeline.mismatch_intervals` 逐段列出，就是真机上该重点复核的时间点。
+- **第三角已可复现**：`--engine compare` + `tools\compare_recording.bat` 把录屏对照
+  做成命令。用基线导出的参考画面合成一张「理想录屏」做端到端探针，1 帧 466 个
+  参与比对的像素逐通道一致（`identical`），ffmpeg 抽帧 / PNG 读回 / bbox 裁剪 /
+  差异热图全链路已验证。
 
-第一版的已知简化：解码器不按 WDS 窗口裁像素、不处理 `cropped` 对象偏移（同一 BDN
-来源的对象都落在窗口内，不影响结论，窗口定义仍解析统计）；源头对拍按事件序号对齐，
-PTS 差只作参考；导出的参考 PNG 是标准 BT.709/601 反变换的 8bit RGBA，仅供人眼 /
-录屏对照，不参与判据。
+边界与简化（第二版后剩下的部分）：
+
+- 解码器仍不模拟 OS 级呈现（vsync 对齐、硬件 overlay 缩放、播放器色彩管理），
+  这些由 `compare` 用真实录屏覆盖；`--nominal` 可用来区分「时间轴标注口径」与
+  「硬解呈现」两类差异。
+- `need` 按 WDS 窗口面积算合成耗时，比 `sup_retime` 的整屏保守上界更精确；
+  两者口径不同，报告里的 `late` 是「按窗口面积」的判定，不是整屏上界判定。
+- `compare` 的默认容差（`--cmp-tol 12` / 占比 0.02 / 内缩 1px / `min_alpha 200`）
+  是为吸收播放器 YCbCr→RGB、缩放与抗锯齿噪声；系统性色偏应查播放器色彩设置，
+  不应靠无限放宽容差掩盖。
+- 源头对拍按事件序号对齐，PTS 差只作参考；导出的参考 PNG 是标准 BT.709/601
+  反变换的 8bit RGBA，仅供录屏对照，不参与软基准判据。
 
 ## SUPer 高质量 PGS（可选）
 
@@ -417,11 +455,11 @@ tools\baseline.bat
 除 Tauri 外只多一个纯 Rust 的 `flate2`（`rust_backend` / miniz_oxide，用来解压 PNG 的 zlib 数据），
 无 C 库、无 DLL，交叉编译不受影响。
 
-发布目录约 7.6 MB，绿色解压即用：
+发布目录约 7.7 MB，绿色解压即用：
 
 ```
 dist\
-├─ supfast.exe            4.2 MB
+├─ supfast.exe            4.3 MB
 ├─ WebView2Loader.dll     157 KB   gnu 目标是动态加载 WebView2，必须带
 └─ mod\                   3.4 MB   avs2bdnxml.exe + csri\VSFilterMod.dll
 ```
@@ -436,13 +474,16 @@ dist\
 ├─ icons\icon.ico              4 根竖条，最后一根是强调橙（make_icon.py 生成）
 ├─ src\engine.rs               引擎：解析 → 切段 → 并行渲染 → 重写 XML / SUP
 ├─ src\pgs.rs                  原生 PGS 编码器：PNG/RLE → epoch 规划 → 调色板渐变 / 帧间对象拆分 → 段序列化
-├─ src\pgsdec.rs               PGS 软件解码器（播放器模型）：SUP → 时间轴画面，对拍基准用
-├─ src\baseline.rs             对拍基准：内容轨 / 时间轴轨 + 黄金帧清单 / 参考画面导出
+├─ src\pgsdec.rs              PGS 软件解码器（播放器模型）：WDS 裁剪 / cropped / DTS 缓冲 / present_pts
+├─ src\baseline.rs            对拍基准：内容轨 + 名义/有效双时间轴 + decode_risk + 黄金帧清单
+├─ src\pngutil.rs             极简 PNG 读写（8bit RGB/RGBA，flate2），基准与真机对照共用
+├─ src\compare.rs             真机录屏对照：ffmpeg 抽帧 → bbox 裁剪 → 逐像素比对 + 差异热图
 ├─ src\verify.rs               SUP 合规自检（零依赖，含 palette update / 多对象显示集检查）
 ├─ src\superenc.rs             可选 SUPer 外部调用
 ├─ src\main.rs                 IPC 路由 + 状态持久化 + 命令行入口
 ├─ ui\index.html               界面（单文件 HTML + CSS + JS）
 ├─ tools\baseline.bat / .ps1   一键跑四组样本的对拍基准（结果进 tools\baseline-results\）
+├─ tools\compare_recording.bat / .ps1  真机录屏对照一键脚本（结果进 tools\compare-results\）
 ├─ tools\gcc_shim.rs           windres 用的最小 gcc -E 垫片（见下）
 ├─ tools\winbox.rs             开发用：从外部改窗口尺寸，方便截图核对排版
 └─ build.bat                   一键编译 + 组装 dist\
@@ -555,17 +596,21 @@ tools\winbox.exe min "Google Chrome"    :: 截图前把挡在前面的窗口最�
   实测四个样本（渐变链 / 拆分链 / test2 / drama）SUPer 的 `is_compliant` 均为
   `(True, 0)`、`check_pts_dts_sanity` 均为 `True`，内置自检同样 0 错 0 警。
   详见 [Rust 原生 PGS](#rust-原生-pgs内置--推荐)。
-- **默认拼段流仍沿用 DTS=0 惯例**：默认 `<名>.sup` 是 avs2bdnxml 各段输出经
-  `sup_retime` 重映射 PTS 拼起来的，不是整流流；PDS / END 仍写 `DTS=0`，拿 SUPer 的
-  `check_pts_dts_sanity` 判会报 out of spec。这是两套工具链的时间戳惯例差异
-  （avs2bdnxml 原始输出 `ref.sup` 本身全项通过），内置自检对此做了豁免；需要 SUPer
-  全项通过的整流流请勾 [Rust 原生 PGS](#rust-原生-pgs内置--推荐)。
+- **默认拼段流仍沿用 DTS=0 惯例，且有硬解风险**：默认 `<名>.sup` 是 avs2bdnxml 各段
+  输出经 `sup_retime` 重映射 PTS 拼起来的，不是整流流；实测 PCS 的 `DTS = PTS`
+  （lead=0），PDS / END 仍写 `DTS=0`、PDS 带 `0xFFFF…` 哨兵 PTS。SUPer 的
+  `check_pts_dts_sanity` 判 out of spec，第二版硬解模型进一步定量：test2 的 174 个、
+  drama 的 2430 个显示集全部来不及在名义 PTS 前完成解码（最大 late 954 / 1879 tick）。
+  内置自检对此做了豁免；需要合规且解码可行的整流流请勾
+  [Rust 原生 PGS](#rust-原生-pgs内置--推荐)，对照数据见
+  [对拍基准](#真机播放验证前置对拍基准)。
 - 无边框窗口用 `data-tauri-drag-region` 拖动，**双击标题栏不会最大化**，用右上角按钮。
 - 目标机器需要 WebView2 运行时（Win10 1803+ 与 Win11 自带）。
 - 右键菜单是关掉的：WebView2 默认会弹「重新加载 / 另存为 / 打印 / 检查」，
   这里用 `SetAreDefaultContextMenusEnabled(false)` 关掉，页面再兜一层 `contextmenu`。
   代价是输入框里右键粘贴没了，`Ctrl+V` 照常可用。
-- **对拍基准只是软解码模型**：`src/pgsdec.rs` 第一版不按 WDS 窗口裁像素、不处理
-  `cropped` 对象偏移，也不模拟硬件解码器的 display set buffering 与实际擦除时间。
-  它验证「同一时刻屏幕上的像素是否一致」，不能替代真机 / 硬解播放验证；真机结论
-  仍需拿黄金帧清单与参考画面录屏核对（见 [对拍基准](#真机播放验证前置对拍基准)）。
+- **对拍基准是软解码模型，不是真机**：第二版已补 WDS 窗口裁剪、`cropped` 对象、
+  DTS 缓冲 / PTS 呈现与 RX / object buffer 峰值，但仍不模拟 OS 级呈现（vsync 对齐、
+  硬件 overlay 缩放、播放器色彩管理）。它验证「同一时刻屏幕上的像素是否一致」，
+  不能替代真机 / 硬解播放验证；第三角请用 `--engine compare` 拿录屏核对
+  （见 [对拍基准](#真机播放验证前置对拍基准)）。

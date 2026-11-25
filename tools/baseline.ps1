@@ -106,8 +106,8 @@ $summary += "# supfast 对拍基准 $stamp"
 $summary += ''
 $summary += '真机播放验证前置基准：源 PNG → SUP 解码画面 → 真机录屏（本工具覆盖前两角）。'
 $summary += ''
-$summary += "| 样本 | 参考流 | 候选 | 综合 | 内容轨 | 一致/等价/差异帧 | 时间轴轨 | 存在性 | 错位 | PTS 最大偏移 | 源头对拍 |"
-$summary += '|---|---|---|---|---|---|---|---:|---:|---:|---|'
+$summary += "| 样本 | 参考流 | 候选 | 综合 | 内容轨 | 一致/等价/差异帧 | 时间轴轨 | 存在性 | 错位 | PTS 最大偏移 | 解码 | 有效轨 | 源头对拍 |"
+$summary += '|---|---|---|---|---|---|---|---:|---:|---:|---|---|---|'
 $paths = @()
 
 foreach ($name in $Samples) {
@@ -148,7 +148,8 @@ foreach ($name in $Samples) {
     foreach ($p in $r.pairs) {
         $sc = $srcMap[$p.name]
         $pairSrc = if ($sc) { "$($sc.verdict) ($($sc.identical_frames)/$($sc.aligned))" } else { 'n/a' }
-        $summary += "| $name | $(Split-Path $def.Ref -Leaf) | $($p.name) | $($p.verdict) | $($p.content.verdict) | $($p.content.identical_frames)/$($p.content.equivalent_frames)/$($p.content.divergent_frames) | $($p.timeline.verdict) | $($p.timeline.presence_mismatch) | $($p.timeline.frame_mismatch) | $($p.timeline.pts_delta.max_ticks) | $pairSrc |"
+        $dec = if ($p.timeline.decode.risk) { '有风险' } else { '可行' }
+        $summary += "| $name | $(Split-Path $def.Ref -Leaf) | $($p.name) | $($p.verdict) | $($p.content.verdict) | $($p.content.identical_frames)/$($p.content.equivalent_frames)/$($p.content.divergent_frames) | $($p.timeline.verdict) | $($p.timeline.presence_mismatch) | $($p.timeline.frame_mismatch) | $($p.timeline.pts_delta.max_ticks) | $dec | $($p.timeline.effective.verdict) | $pairSrc |"
     }
     $paths += "- $name 报告：$report"
     $paths += "- $name 黄金帧清单：$frames（$($r.golden.frame_count) 帧，参考画面 $($r.golden.png_count) 张）"
@@ -166,13 +167,18 @@ $summary += '- equivalent：内容轨只差 --color-tol 以内（YCbCr 舍入 / 
 $summary += '- content_ok_time_shift：每一帧画面都无损，但两流的 PTS 有平移，或清屏时机不同'
 $summary += '  （默认拼段流按段单调化，原生整流流按事件 out 补清屏）。这是真实的播放差异，'
 $summary += '  真机验证时重点看报告 timeline.mismatch_intervals 列出的时间段。'
+$summary += '- decode_risk：任一流存在 late 显示集（DTS + 解码耗时 > PTS）或 RX / object buffer 超限，'
+$summary += '  名义时间轴已不足以描述真机行为，须看 timeline.effective 与 timeline.decode。'
 $summary += '- divergent：内容帧有超过容差的实质差异，需要定位（看 content.worst）。'
+$summary += ''
+$summary += '解码列来自硬解模型：段按 DTS 进 RX buffer，RLE 解码受 Rd=16e6 px/s、清屏/合成受 Rc=32e6 px/s 限制，'
+$summary += ' `present_pts = max(pts, dts + need)`；有效轨即基于 present_pts 重新采样的时间轴。'
 $summary += ''
 $summary += '源头对拍（--xml）按事件序号对齐，PTS 差只作参考：拼段流的 PTS 经 sup_retime'
 $summary += ' 重映射，与 BDN InTC 本来就不在同一基准上。'
 $summary += ''
-$summary += '真机对照流程：拿黄金帧清单里的 PTS / bbox / hash 与参考画面 PNG，'
-$summary += '在播放器输出里按帧号抽帧，裁到同一 bbox 后逐像素比对（或肉眼核对）。'
+$summary += '真机对照：跑 tools\compare_recording.bat，传 --Frames <本轮 *.frames.json> --Recording <录屏>，'
+$summary += ' 工具按 present_pts 用 ffmpeg 抽帧、裁到同一 bbox 逐像素比对，并导出差异热图与 JSON 判定。'
 
 $mdPath = Join-Path $results "${stamp}_summary.md"
 [System.IO.File]::WriteAllText($mdPath, ($summary -join "`r`n"), $utf8)

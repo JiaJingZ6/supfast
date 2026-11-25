@@ -20,6 +20,7 @@ screenshot*.png
 # 基准/性能脚本跑出来的报告与中间帧（生成物，不入库）
 /tools/bench-results/
 /tools/baseline-results/
+/tools/compare-results/
 
 # 系统/编辑器杂项
 .DS_Store

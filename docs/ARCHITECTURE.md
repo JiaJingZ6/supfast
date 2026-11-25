@@ -51,10 +51,13 @@
 | [pack-release.bat](file:///H:/DIY/rea_sup/tauri/pack-release.bat) | `dist\` + README → `release\*.zip` | 发版改版本号 |
 | [.github/workflows/release.yml](file:///H:/DIY/rea_sup/tauri/.github/workflows/release.yml) | 打 `v*` tag 时把仓库里的 zip 发成 Release | 少改 |
 | [src/verify.rs](file:///H:/DIY/rea_sup/tauri/src/verify.rs) | SUP 合规自检（零依赖，含 palette update / 多对象检查） | 加检查项时 |
-| [src/pgsdec.rs](file:///H:/DIY/rea_sup/tauri/src/pgsdec.rs) | PGS 软件解码器（播放器模型），对拍基准的画面还原 | 改解码语义时 |
-| [src/baseline.rs](file:///H:/DIY/rea_sup/tauri/src/baseline.rs) | 对拍基准：内容轨 / 时间轴轨、黄金帧清单、参考画面 PNG | 改判据时 |
+| [src/pgsdec.rs](file:///H:/DIY/rea_sup/tauri/src/pgsdec.rs) | PGS 软件解码器：WDS 裁剪 / cropped / DTS 缓冲 / present_pts | 改解码语义时 |
+| [src/baseline.rs](file:///H:/DIY/rea_sup/tauri/src/baseline.rs) | 对拍基准：内容轨 + 名义/有效双时间轴 + decode_risk、黄金帧清单、参考 PNG | 改判据时 |
+| [src/pngutil.rs](file:///H:/DIY/rea_sup/tauri/src/pngutil.rs) | 极简 PNG 读写（8bit RGB/RGBA，flate2），基准与真机对照共用 | 改参考画面格式时 |
+| [src/compare.rs](file:///H:/DIY/rea_sup/tauri/src/compare.rs) | 真机录屏对照：ffmpeg 抽帧 → bbox 裁剪 → 逐像素比对 + 差异热图 | 改真机判据时 |
 | [src/superenc.rs](file:///H:/DIY/rea_sup/tauri/src/superenc.rs) | 可选 SUPer 外部调用 | 换后端时 |
 | [tools/baseline.ps1](file:///H:/DIY/rea_sup/tauri/tools/baseline.ps1) | 一键跑四组样本的对拍基准，产出 JSON + Markdown 摘要 | 加样本时 |
+| [tools/compare_recording.ps1](file:///H:/DIY/rea_sup/tauri/tools/compare_recording.ps1) | 真机录屏对照一键脚本，产出 JSON + 摘要 + 截图 | 加真机样本时 |
 | [tools/gcc_shim.rs](file:///H:/DIY/rea_sup/tauri/tools/gcc_shim.rs) | 编译期工具链垫片（windres 需要 `gcc -E`） | 见 7.3 |
 | [tools/winbox.rs](file:///H:/DIY/rea_sup/tauri/tools/winbox.rs) | 开发期从外部改窗口尺寸/最小化别的窗口，便于截图 | 调试用 |
 | [make_icon.py](file:///H:/DIY/rea_sup/tauri/make_icon.py) | 零依赖生成 `icons/icon.ico` | 换图标时 |
@@ -80,7 +83,7 @@ dist\
 
 入口在 [main.rs 的 main()](file:///H:/DIY/rea_sup/tauri/src/main.rs#L680-L800)，顺序很关键：
 
-1. **CLI 分流**：`argv[1] == "--engine"` 时不启动 GUI，直接进 [`cli_engine()`](file:///H:/DIY/rea_sup/tauri/src/main.rs#L520-L602)（`analyze` / `convert` 两个子命令）。release 版没有 stdout，所以结果写 `--json <file>`。这是一条独立于界面的对拍/回归通道。
+1. **CLI 分流**：`argv[1] == "--engine"` 时不启动 GUI，直接进 [`cli_engine()`](file:///H:/DIY/rea_sup/tauri/src/main.rs#L680-L960)（`analyze` / `convert` / `verify` / `pgs` / `baseline` / `compare` 六种模式）。release 版没有 stdout，所以结果写 `--json <file>`；GUI 子系统 exe 在一键脚本里要用 `Start-Process -Wait -PassThru` 明确等待。这是一条独立于界面的对拍/回归/真机对照通道。
 2. **单实例闸门**：[`single::acquire()`](file:///H:/DIY/rea_sup/tauri/src/main.rs#L617-L678) 用命名互斥体 `supfast_single_instance_v1`。拿不到锁就 `EnumWindows` 找到标题为 `supfast` 的窗口并恢复前台，然后直接返回。原因：WebView2 用户数据目录独占，第二个进程会以 `HRESULT 0x800700AA` 失败，而 GUI 进程没有控制台，用户只看到“双击没反应”。
 3. **Tauri Builder**：
    - 注册 `tauri_plugin_dialog`（文件/目录选择）。
@@ -167,10 +170,13 @@ fn api(sh: State<'_, Shared>, path: String, body: Value) -> Result<Value, String
 
 ### 4.5 CLI 与工具函数
 
-- `cli_engine()`：五种模式 `analyze / convert / verify / pgs / baseline`。前四种解析
-  `--ass/--out/--fps/--jobs/--json` 等，analyze 只输出摘要字段（`bands_len` /
-  `timeline_len` 代替整条数组）；`baseline` 额外接 `--ref/--cand/--xml/--tol/
-  --color-tol/--ratio-tol/--frames/--png-dir/--max-png`，调 `baseline::run`。
+- `cli_engine()`：六种模式 `analyze / convert / verify / pgs / baseline / compare`。
+  前四种解析 `--ass/--out/--fps/--jobs/--json` 等，analyze 只输出摘要字段
+  （`bands_len` / `timeline_len` 代替整条数组）；`baseline` 额外接
+  `--ref/--cand/--xml/--tol/--color-tol/--ratio-tol/--frames/--png-dir/--max-png`，
+  调 `baseline::run`；`compare` 接 `--frames/--recording/--ffmpeg/--offset-ms/
+  --cmp-tol/--cmp-ratio-tol/--shrink/--min-alpha/--nominal/--max-frames/--shots-dir`，
+  调 `compare::run`。`--frames` / `--png-dir` / `--json` 两个模式共用变量。
 - `fmt_n`（千分位）、`file_name`、`remember`（按 `\`→`/` 小写去重）。
 
 ---
@@ -334,14 +340,13 @@ Normal Case 不清空对象缓冲、且允许同集定义新对象，才能合�
 
 ### 5.7 对拍基准（src/pgsdec.rs / src/baseline.rs）
 
-真机硬解验证没法自动化，先把「播放器模型」下的等价性做成可复现的软基准：
-`pgsdec` 把任意 `.sup` 还原成「显示集 PTS → 稀疏画面（YCrCb + Alpha）」，
-`baseline` 在两流之间做双轨对拍，并导出黄金帧清单供真机录屏对照。
+真机硬解验证没法自动化，先把「播放器模型」下的等价性做成可复现的软基准（第二版
+补上硬解缓冲模型），再把第三角做成可复现的录屏对照命令（见 5.8）。
 
 三角关系：源 PNG（BDN ground truth）→ SUP 解码画面（本工具）→ 真机播放输出。
-本工具覆盖前两角，第三角靠导出的帧清单与参考画面 PNG 人工/录屏对照。
+`baseline` 覆盖前两角，`compare` 覆盖第三角。
 
-解码器模型：
+解码器模型（第二版）：
 
 - 拆段 → PCS…END 显示集；Epoch Start 清对象 / 调色板 / 窗口 / 画面构成，
   Acquisition / Normal Case 保留 epoch 内对象（否则无法复用 `object_id`）；
@@ -349,30 +354,55 @@ Normal Case 不清空对象缓冲、且允许同集定义新对象，才能合�
   因此差分 palette update 只需携带变化条目；
 - 每个 END 提交一帧；composition objects 为空就是清屏帧；
 - 画面只保留 `alpha > 0` 的像素，按 `(y*stride+x)` 排序，hash 为 FNV-1a 64。
-  透明色的 RGB 不参与比较（PGS 里没有意义）；
-- **第一版简化**：不按 WDS 窗口裁像素。同一 BDN 来源的对象都落在窗口内，
-  裁剪与否结果相同；窗口定义仍被解析并统计。也不处理 `cropped` 对象偏移。
+  透明色的 RGB 不参与比较；
+- **WDS 窗口裁剪**：cobj 引用的窗口有效（w/h>0）时，落在窗口矩形外的像素不显示；
+  没有对应 WDS 或窗口为空时保持不裁剪。窗口定义按 id 覆盖更新；
+- **cropped 对象**：PCS cobj 第 4 字节 bit7 = `object_cropped_flag`，带 8 字节
+  `(cx,cy,cw,ch)` 时从对象内部取子矩形贴到 `(x,y)`；cobj 变长解析，bit6 是 forced；
+- **DTS 缓冲 / PTS 呈现**：`need = clear(90000·plane/Rc) + decode(90000·obj_px/Rd)
+  + compose(90000·plane/Rc)`，`plane` 取 WDS 窗口面积（无窗口则整屏）；
+  `dts` 取 PCS 段头，为 0 时按 `pts - need` 兜底（不凭空造 late）；
+  `present_pts = max(pts, dts + need)`，`late = present_pts - pts`；
+- **buffer 峰值**：按 `(dts, +bytes)` / `(pts, -bytes)` 事件排序列出 RX buffer 峰值
+  （上限 1 MiB）；epoch 内累积对象像素数（上限 4 MiB）；DTS 非单调单独计数。
 
-双轨对拍：
+双轨对拍 + 硬解轨：
 
 | 轨 | 做法 | 回答 |
 |---|---|---|
 | 内容 | 可见帧按序号对齐，hash 不同的帧二次解码取像素逐通道比对 | 每张图有没有被编对 |
-| 时间轴 | 两流所有 PTS 的并集上采样，取各自「最后一个 `pts ≤ t`」的帧比 hash | 同一时刻挂着哪张画面 |
+| 时间轴（名义） | 两流所有 PTS 的并集上采样，取各自「最后一个 `pts ≤ t`」的帧比 hash | 同一时刻挂着哪张画面 |
+| 时间轴（有效） | 同上但改用 `present_pts`（late 帧会被推后） | 硬解真正来得及呈现的画面 |
+| 解码可行性 | 任一流 `late_display_sets > 0` 或 RX / object buffer 超限 → `decode_risk` | 名义时间轴还能不能信 |
 
-时间轴轨把 hash 不同再分三类：`presence`（一方已清屏）、`color_only`（像素集合与
-bbox 完全相同，只是 ±1 的 YCbCr 舍入）、`frame_mismatch`（真错位）。只有真实错位 /
-存在性差异 / 按序号的 PTS 平移才计入「时间轴不一致」—— 否则工具链间的舍入差会被
-误报成花屏。二次解码只对 hash 不同的帧、按 256 帧分块，内存 O(一帧)。
+时间轴轨把 hash 不同再分三类：`presence`、`color_only`、`frame_mismatch`。只有真实
+错位 / 存在性差异 / 按序号的 PTS 平移才计入「时间轴不一致」。综合判据优先级：
+`divergent` > `decode_risk` > `content_ok_time_shift` > `equivalent` > `identical`。
+二次解码只对 hash 不同的帧、按 256 帧分块，内存 O(一帧)；有效轨用按
+`(present_pts, 帧号)` 预排序的索引二分，避免 O(n²)。
 
 `--xml` 另做源头对拍：复用 `pgs.rs` 的 `parse_bdn` / `decode_png` / `palette_entries`，
 把每个事件的源 PNG 组合成期望画面，按事件序号与各流的可见帧对齐。源头对拍按序号，
 PTS 差只作参考 —— 拼段流的 PTS 经 `sup_retime` 重映射，与 BDN `InTC` 不在同一基准。
 
-入口是 `main.rs` 的 `--engine baseline`，一键脚本 `tools/baseline.bat` → `baseline.ps1`，
-结果落 `tools/baseline-results/`：`<stamp>_<sample>.json`（完整报告）、
-`<stamp>_<sample>.frames.json`（黄金帧清单）、`<stamp>_<sample>.png/`（参考画面）、
-`<stamp>_summary.md`（汇总）。实测数据与判据见 README。
+### 5.8 真机录屏对照（src/compare.rs / src/pngutil.rs）
+
+`--engine compare` 读 `baseline` 导出的 `*.frames.json`（含 `png_dir` / `present_pts`
+/ `bbox` / `png`），对每帧用 ffmpeg 在 `present_pts - offset_ms` 抽一帧、缩放到源
+视频尺寸，裁到 bbox 与参考 RGBA PNG 逐像素比 RGB。`pngutil.rs` 是零第三方图像库的
+8bit RGB/RGBA PNG 读写（含 filter 0..4 解码），基准导出与录屏对照共用。
+
+判据 `identical` / `equivalent`（超容差占比 ≤ `--cmp-ratio-tol`）/ `divergent` /
+`error`（ffmpeg 抽不到帧）；默认 `--cmp-tol 12` / 0.02 / `--shrink 1` /
+`--min-alpha 200` 用来吸收播放器 YCbCr→RGB、缩放与抗锯齿噪声。每帧导出
+`*.shot.png`（录屏裁图）与 `*.diff.png`（差异热图），一键脚本
+`tools\compare_recording.bat` → `compare_recording.ps1` 落 `tools\compare-results\`。
+`--nominal` 可切回名义 PTS 抽帧，用来区分时间轴标注口径与硬解呈现两类差异。
+
+入口与产物：`main.rs` 的 `--engine baseline` / `--engine compare`；一键脚本
+`tools\baseline.bat` → `baseline.ps1` 与 `tools\compare_recording.bat` →
+`compare_recording.ps1`。结果分别落 `tools\baseline-results/` 与
+`tools\compare-results/`。实测数据与判据见 README。
 
 ---
 
@@ -562,6 +592,7 @@ Tauri 2 的权限白名单，作用于 `main` 窗口：
 | 改产物布局 | `engine::resolve_outdir`（前端只展示后端算出的 `outdir`） |
 | 改 SUP 编码方式 | `src/pgs.rs`（原生整流 / 调色板渐变）或 `src/superenc.rs`（外部 SUPer）；两者都只吃 XML + PNG，产物并列不覆盖默认 `.sup` |
 | 跑真机验证前的对拍基准 | `tools\baseline.bat` → `tools\baseline.ps1` → `--engine baseline`；改判据看 `src/baseline.rs`，改解码语义看 `src/pgsdec.rs` |
+| 拿录屏核对真机输出 | `tools\compare_recording.bat -Frames <frames.json> -Recording <rec.mp4> -OffsetMs <ms>` → `--engine compare`；改判据看 `src/compare.rs` |
 | 加一个 IPC 接口 | `main::route` 分支 + 前端 `rpc('/api/xxx')`；窗口/对话框等系统能力还要改 `capabilities/default.json` |
 | 改进度/日志 UI | `ui` 的 `setStage/setPct/pushLog` + `poll()`；后端事件在 `engine::Emit` 的 `t` 字段 |
 | 换图标 | `make_icon.py` 后删 `icons/icon.ico` 重跑 `build.bat` |

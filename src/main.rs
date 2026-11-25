@@ -10,6 +10,8 @@ mod superenc;
 mod pgs;
 mod pgsdec;
 mod baseline;
+mod pngutil;
+mod compare;
 
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
@@ -689,6 +691,17 @@ fn cli_engine(args: &[String]) -> i32 {
     let mut frames_out = String::new();
     let mut png_dir = String::new();
     let mut max_png = 64_usize;
+    // 真机录屏对照（--engine compare）
+    let mut recording = String::new();
+    let mut ffmpeg_cmd = String::new();
+    let mut offset_ms = 0.0_f64;
+    let mut cmp_tol = 12_u8;
+    let mut cmp_ratio_tol = 0.02_f64;
+    let mut shrink = 1_u32;
+    let mut min_alpha = 200_u8;
+    let mut shots_dir = String::new();
+    let mut cmp_max_frames = 0_usize;
+    let mut cmp_nominal = false;
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
@@ -697,6 +710,7 @@ fn cli_engine(args: &[String]) -> i32 {
             "verify" => mode = "verify",
             "pgs" => mode = "pgs",
             "baseline" => mode = "baseline",
+            "compare" => mode = "compare",
             "--ass" => {
                 i += 1;
                 ass = args.get(i).cloned().unwrap_or_default();
@@ -787,9 +801,76 @@ fn cli_engine(args: &[String]) -> i32 {
                 i += 1;
                 max_png = args.get(i).and_then(|s| s.parse().ok()).unwrap_or(64);
             }
+            "--recording" => {
+                i += 1;
+                recording = args.get(i).cloned().unwrap_or_default();
+            }
+            "--ffmpeg" => {
+                i += 1;
+                ffmpeg_cmd = args.get(i).cloned().unwrap_or_default();
+            }
+            "--offset-ms" => {
+                i += 1;
+                offset_ms = args.get(i).and_then(|s| s.parse().ok()).unwrap_or(0.0);
+            }
+            "--cmp-tol" => {
+                i += 1;
+                cmp_tol = args.get(i).and_then(|s| s.parse().ok()).unwrap_or(12);
+            }
+            "--cmp-ratio-tol" => {
+                i += 1;
+                cmp_ratio_tol = args.get(i).and_then(|s| s.parse().ok()).unwrap_or(0.02);
+            }
+            "--shrink" => {
+                i += 1;
+                shrink = args.get(i).and_then(|s| s.parse().ok()).unwrap_or(1);
+            }
+            "--min-alpha" => {
+                i += 1;
+                min_alpha = args.get(i).and_then(|s| s.parse().ok()).unwrap_or(200);
+            }
+            "--shots-dir" => {
+                i += 1;
+                shots_dir = args.get(i).cloned().unwrap_or_default();
+            }
+            "--max-frames" => {
+                i += 1;
+                cmp_max_frames = args.get(i).and_then(|s| s.parse().ok()).unwrap_or(0);
+            }
+            "--nominal" => cmp_nominal = true,
             _ => {}
         }
         i += 1;
+    }
+    if mode == "compare" {
+        if frames_out.is_empty() || recording.is_empty() {
+            eprintln!("用法: supfast --engine compare --frames <frames.json> --recording <video> [--ffmpeg <path>] [--png-dir <dir>] [--offset-ms 0] [--cmp-tol 12] [--cmp-ratio-tol 0.02] [--shrink 1] [--min-alpha 200] [--nominal] [--max-frames 0] [--shots-dir <dir>] [--json <report.json>]");
+            return 2;
+        }
+        let opts = compare::Options {
+            frames: PathBuf::from(&frames_out),
+            recording: PathBuf::from(&recording),
+            ffmpeg: if ffmpeg_cmd.is_empty() { None } else { Some(ffmpeg_cmd.clone()) },
+            png_dir: if png_dir.is_empty() { None } else { Some(PathBuf::from(&png_dir)) },
+            offset_ms,
+            tol: cmp_tol,
+            ratio_tol: cmp_ratio_tol,
+            shrink,
+            min_alpha,
+            nominal: cmp_nominal,
+            max_frames: cmp_max_frames,
+            shots_dir: if shots_dir.is_empty() { None } else { Some(PathBuf::from(&shots_dir)) },
+        };
+        return match compare::run(&opts) {
+            Ok(v) => {
+                emit_json(&serde_json::to_string_pretty(&v).unwrap(), &json_out);
+                0
+            }
+            Err(e) => {
+                eprintln!("真机录屏对照失败: {}", e);
+                1
+            }
+        };
     }
     if mode == "baseline" {
         if ref_sup.is_empty() || cands.is_empty() {
@@ -870,6 +951,7 @@ fn cli_engine(args: &[String]) -> i32 {
         eprintln!("     supfast --engine verify --sup <file.sup> [--json <out.json>]");
         eprintln!("     supfast --engine pgs --xml <file.xml> [--out <file.sup>] [--no-palette-fade] [--no-object-split] [--json <out.json>]");
         eprintln!("     supfast --engine baseline --ref <file.sup> --cand <name>=<file.sup> [--cand ...] [--xml <bdn.xml>] [--frames <out.json>] [--png-dir <dir>] [--json <report.json>]");
+        eprintln!("     supfast --engine compare --frames <frames.json> --recording <video> [--ffmpeg <path>] [--offset-ms 0] [--shots-dir <dir>] [--json <report.json>]");
         return 2;
     }
     let opts = json!({ "ass": ass, "fps": fps, "jobs": jobs, "outdir": out,

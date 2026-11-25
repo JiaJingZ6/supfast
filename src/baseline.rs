@@ -15,22 +15,25 @@
 //! 另一边还挂着字幕」这种真实的播放差异单独报出来。
 //!
 //! 对拍分两条轨道：内容轨（可见帧按序号对齐，验证「每张图有没有编对」）与
-//! 时间轴轨（在两流 PTS 并集上采样，验证「同一时刻挂着哪张画面」）。
+//! 时间轴轨（在两流 PTS 并集上采样，验证「同一时刻挂着哪张画面」）。第二版
+//! 再叠加一层硬解模型：段按 DTS 入 RX buffer，RLE 解码受 Rd、清屏/合成受 Rc
+//! 限制，`present_pts = max(pts, dts + need)`；另给一条基于 present_pts 的
+//! 「有效时间轴」轨，并按 RX/object buffer 峰值与 late 显示集给出 decode_risk。
+//!
 //! 综合判据：identical（两轨都一致）/ content_ok_time_shift（内容无损但时间轴
 //! 有平移或清屏时机差异，真机验证重点）/ equivalent（内容仅有颜色舍入级差异）/
-//! divergent（内容帧有实质差异）。
+//! divergent（内容帧有实质差异）/ decode_risk（任一流显示集来不及解码或缓冲超限，
+//! 名义时间轴已不足以描述真机行为，须看 effective_timeline）。
 //!
 //! 画面在 PGS 原生域 `[Y, Cr, Cb, Alpha]` 比对，不做 YCbCr→RGB 往返，
 //! 透明像素的 RGB 不参与比较（PGS 里没有意义）。
 
 use crate::pgsdec;
+use crate::pngutil::write_rgba_png;
 use crate::verify;
-use flate2::write::ZlibEncoder;
-use flate2::Compression;
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
 use std::fs;
-use std::io::Write;
 use std::path::{Path, PathBuf};
 
 const MAX_WORST: usize = 20;
@@ -104,58 +107,26 @@ fn stream_brief(d: &pgsdec::Decoded) -> Value {
         "last_pts": last,
         "duration_s": r4((last.saturating_sub(first)) as f64 / pgsdec::PGS_HZ),
         "incomplete_ds": d.incomplete_ds,
+        "ds_bytes_total": d.frames.iter().map(|f| f.ds_bytes).sum::<usize>(),
+        "obj_pixels_total": d.frames.iter().map(|f| f.obj_pixels).sum::<u64>(),
         "undefined_refs": d.frames.iter().map(|f| f.undefined_refs).sum::<usize>(),
         "undefined_pal": d.frames.iter().map(|f| f.undefined_pal).sum::<usize>(),
+        "clip": {
+            "clipped_pixels": d.clipped_pixels,
+            "cropped_objects": d.cropped_objects,
+        },
+        "decode": {
+            "late_display_sets": d.late_display_sets,
+            "max_late_ticks": d.max_late_ticks,
+            "present_shifted": d.present_shifted,
+            "rx_peak_bytes": d.rx_peak_bytes,
+            "rx_limit_bytes": 1 << 20,
+            "over_rx": d.over_rx,
+            "over_obj": d.over_obj,
+            "dts_not_mono": d.dts_not_mono,
+            "feasible": d.decode_feasible(),
+        },
     })
-}
-
-// ---------------------------------------------------------------------------
-// PNG 写出（给真机录屏对照用的参考画面，8bit RGBA，无第三方图像库）
-// ---------------------------------------------------------------------------
-
-fn crc32(data: &[u8]) -> u32 {
-    let mut c = 0xffff_ffffu32;
-    for &b in data {
-        c ^= b as u32;
-        for _ in 0..8 {
-            c = if c & 1 != 0 { (c >> 1) ^ 0xedb8_8320 } else { c >> 1 };
-        }
-    }
-    !c
-}
-
-fn chunk(out: &mut Vec<u8>, typ: &[u8; 4], data: &[u8]) {
-    out.extend_from_slice(&(data.len() as u32).to_be_bytes());
-    out.extend_from_slice(typ);
-    out.extend_from_slice(data);
-    let mut c = Vec::with_capacity(4 + data.len());
-    c.extend_from_slice(typ);
-    c.extend_from_slice(data);
-    out.extend_from_slice(&crc32(&c).to_be_bytes());
-}
-
-fn write_rgba_png(path: &Path, w: u32, h: u32, rgba: &[u8]) -> Result<(), String> {
-    if w == 0 || h == 0 {
-        return Err("空画面不导出 PNG".into());
-    }
-    let mut raw = Vec::with_capacity((w as usize * 4 + 1) * h as usize);
-    for y in 0..h as usize {
-        raw.push(0u8); // filter: None
-        let o = y * w as usize * 4;
-        raw.extend_from_slice(&rgba[o..o + w as usize * 4]);
-    }
-    let mut enc = ZlibEncoder::new(Vec::new(), Compression::new(6));
-    enc.write_all(&raw).map_err(|e| format!("zlib 压缩失败: {}", e))?;
-    let idat = enc.finish().map_err(|e| format!("zlib 收尾失败: {}", e))?;
-    let mut out = b"\x89PNG\r\n\x1a\n".to_vec();
-    let mut ihdr = Vec::with_capacity(13);
-    ihdr.extend_from_slice(&w.to_be_bytes());
-    ihdr.extend_from_slice(&h.to_be_bytes());
-    ihdr.extend_from_slice(&[8, 6, 0, 0, 0]); // 8bit RGBA, no interlace
-    chunk(&mut out, b"IHDR", &ihdr);
-    chunk(&mut out, b"IDAT", &idat);
-    chunk(&mut out, b"IEND", &[]);
-    fs::write(path, out).map_err(|e| format!("写 PNG 失败 {}: {}", path.display(), e))
 }
 
 /// 黄金帧清单：每个显示集一行，含 PTS / 帧号 / hash / bbox / 不透明像素数。
@@ -201,6 +172,13 @@ fn golden(
             "hash": format!("{:016x}", f.hash),
             "opaque_pixels": f.opaque,
             "bbox": f.bbox,
+            "dts": f.dts,
+            "present_pts": f.present_pts,
+            "decode_ticks": f.decode_ticks,
+            "late_ticks": f.late_ticks,
+            "on_time": f.on_time(),
+            "clipped_pixels": f.clipped_pixels,
+            "cropped": f.cropped,
             "png": Value::Null,
         });
         if let (Some(dir), Some(p)) = (png_dir, px.get(&i)) {
@@ -229,6 +207,7 @@ fn golden(
         "fps": o.fps,
         "frames": frames,
         "png_count": px.len(),
+        "png_dir": o.png_dir.as_ref().map(|p| p.to_string_lossy().to_string()).unwrap_or_default(),
     });
     if let Some(p) = &o.frames_out {
         if let Some(parent) = p.parent() {
@@ -341,19 +320,34 @@ fn diff_json(d: &PxDiff) -> Value {
     })
 }
 
-/// 取「最后一个 pts <= t」的帧下标
-fn frame_at(frames: &[pgsdec::FrameMeta], t: u32) -> Option<usize> {
-    let mut lo = 0usize;
-    let mut hi = frames.len();
-    while lo < hi {
-        let mid = (lo + hi) / 2;
-        if frames[mid].pts <= t {
-            lo = mid + 1;
-        } else {
-            hi = mid;
+/// 取「最后一个 key <= t」的帧下标。`use_present` 用硬解呈现时刻，否则用名义 PTS。
+/// 这是给单测 / 小数据用的线性版本；生产路径走 `sample_timeline` 里的二分索引，
+/// 避免整片流上 O(n²)。
+#[allow(dead_code)]
+fn frame_at_ex(frames: &[pgsdec::FrameMeta], t: u32, use_present: bool) -> Option<usize> {
+    if !use_present {
+        let mut lo = 0usize;
+        let mut hi = frames.len();
+        while lo < hi {
+            let mid = (lo + hi) / 2;
+            if frames[mid].pts <= t { lo = mid + 1 } else { hi = mid }
+        }
+        return if lo == 0 { None } else { Some(lo - 1) };
+    }
+    let mut best: Option<usize> = None;
+    let mut best_t = 0u32;
+    for (i, f) in frames.iter().enumerate() {
+        if f.present_pts <= t && (best.is_none() || f.present_pts >= best_t) {
+            best = Some(i);
+            best_t = f.present_pts;
         }
     }
-    if lo == 0 { None } else { Some(lo - 1) }
+    best
+}
+
+#[allow(dead_code)]
+fn frame_at(frames: &[pgsdec::FrameMeta], t: u32) -> Option<usize> {
+    frame_at_ex(frames, t, false)
 }
 
 fn pixels_of(path: &Path, want: &HashSet<usize>) -> Result<HashMap<usize, Vec<(u32, [u8; 4])>>, String> {
@@ -366,6 +360,135 @@ fn pixels_of(path: &Path, want: &HashSet<usize>) -> Result<HashMap<usize, Vec<(u
 struct PairResult {
     value: Value,
     verdict: String,
+}
+
+struct TlSample {
+    identical: usize,
+    presence: usize,
+    color_only: usize,
+    frame_mismatch: usize,
+    not_started: usize,
+    sample_points: usize,
+    intervals: Vec<(u32, u32, usize, &'static str)>,
+    verdict: &'static str,
+}
+
+fn decode_brief(d: &pgsdec::Decoded) -> Value {
+    json!({
+        "late_display_sets": d.late_display_sets,
+        "max_late_ticks": d.max_late_ticks,
+        "present_shifted": d.present_shifted,
+        "rx_peak_bytes": d.rx_peak_bytes,
+        "over_rx": d.over_rx,
+        "over_obj": d.over_obj,
+        "dts_not_mono": d.dts_not_mono,
+        "feasible": d.decode_feasible(),
+    })
+}
+
+/// 在两流所有关键时刻的并集上采样，比较「此刻屏幕上挂着哪张画面」。
+/// `use_present=true` 时用硬解呈现时刻 `present_pts`（late 帧会被推后），
+/// 更贴近真机；否则用名义 PTS。只比 hash，不比像素：PTS 平移会让 A 的第 k
+/// 帧撞上 B 的第 k±1 帧，那是时序问题，不该算成画质误差。
+fn sample_timeline(
+    refd: &pgsdec::Decoded,
+    candd: &pgsdec::Decoded,
+    use_present: bool,
+) -> TlSample {
+    let key = |f: &pgsdec::FrameMeta| if use_present { f.present_pts } else { f.pts };
+    // present_pts 不保证与帧序同序，预先按 (时刻, 帧号) 排序，二分取
+    // 「最后一个 时刻 <= t」，同刻自然取最后提交的那帧。
+    let build = |d: &pgsdec::Decoded| -> Vec<(u32, usize)> {
+        let mut v: Vec<(u32, usize)> = d.frames.iter().enumerate()
+            .map(|(i, f)| (key(f), i)).collect();
+        v.sort_unstable();
+        v
+    };
+    let ia = build(refd);
+    let ib = build(candd);
+    let at = |idx: &[(u32, usize)], t: u32| -> Option<usize> {
+        let mut lo = 0usize;
+        let mut hi = idx.len();
+        while lo < hi {
+            let m = (lo + hi) / 2;
+            if idx[m].0 <= t { lo = m + 1 } else { hi = m }
+        }
+        if lo == 0 { None } else { Some(idx[lo - 1].1) }
+    };
+    let mut samples: Vec<u32> = ia.iter().chain(ib.iter()).map(|e| e.0).collect();
+    samples.sort_unstable();
+    samples.dedup();
+    let mut identical = 0usize;
+    let mut presence = 0usize;
+    let mut color_only = 0usize;
+    let mut frame_mismatch = 0usize;
+    let mut not_started = 0usize;
+    let mut intervals: Vec<(u32, u32, usize, &'static str)> = Vec::new();
+    let mut run_start: Option<(u32, u32, usize, &'static str)> = None;
+    for &t in &samples {
+        let (ai, bi) = (at(&ia, t), at(&ib, t));
+        let kind = match (ai, bi) {
+            (None, _) | (_, None) => "not_started",
+            (Some(a), Some(b)) => {
+                let fa = &refd.frames[a];
+                let fb = &candd.frames[b];
+                if fa.hash == fb.hash {
+                    "identical"
+                } else if fa.is_clear() != fb.is_clear() {
+                    "presence"
+                } else if fa.opaque == fb.opaque && fa.bbox == fb.bbox {
+                    // 像素集合一模一样，只有颜色值不同：工具链间 ±1 的 YCbCr
+                    // 舍入差，不是画面错位，也不该算成时序问题。
+                    "color_only"
+                } else {
+                    "frame_mismatch"
+                }
+            }
+        };
+        match kind {
+            "identical" => identical += 1,
+            "presence" => presence += 1,
+            "color_only" => color_only += 1,
+            "frame_mismatch" => frame_mismatch += 1,
+            _ => not_started += 1,
+        }
+        let mismatch = kind == "presence" || kind == "frame_mismatch";
+        if mismatch {
+            match &mut run_start {
+                Some(r) => {
+                    r.1 = t;
+                    r.2 += 1;
+                    if r.3 != kind { r.3 = "mixed" }
+                }
+                None => run_start = Some((t, t, 1, kind)),
+            }
+        } else if let Some(r) = run_start.take() {
+            intervals.push(r);
+        }
+    }
+    if let Some(r) = run_start.take() {
+        intervals.push(r);
+    }
+    let verdict = if presence == 0 && frame_mismatch == 0 && color_only == 0 && not_started == 0 {
+        "identical"
+    } else if frame_mismatch > 0 {
+        "shifted"
+    } else if presence > 0 {
+        "presence_diff"
+    } else {
+        "color_only"
+    };
+    TlSample {
+        identical, presence, color_only, frame_mismatch, not_started,
+        sample_points: samples.len(), intervals, verdict,
+    }
+}
+
+fn intervals_json(t: &TlSample) -> Value {
+    json!(t.intervals.iter().take(MAX_INTERVALS).map(|&(a, b, n, k)| json!({
+        "start_pts": a, "end_pts": b, "start": clock(a), "end": clock(b),
+        "samples": n, "kind": k,
+    })).collect::<Vec<_>>())
 }
 
 fn compare_pair(
@@ -459,77 +582,10 @@ fn compare_pair(
         "identical"
     };
 
-    // ---- 轨道 2：时间轴 -----------------------------------------------
-    // 在两流所有 PTS 的并集上采样，比较「此刻屏幕上挂着哪张画面」。
-    // 只比 hash，不做像素比对：PTS 平移会让 A 的第 k 帧撞上 B 的第 k±1 帧，
-    // 那种错位是时序问题，不该被算成画质误差。
-    let mut samples: Vec<u32> = refd.frames.iter().map(|f| f.pts)
-        .chain(candd.frames.iter().map(|f| f.pts)).collect();
-    samples.sort_unstable();
-    samples.dedup();
-    let mut tl_identical = 0usize;
-    let mut tl_presence = 0usize;
-    let mut tl_color = 0usize;
-    let mut tl_frame = 0usize;
-    let mut tl_not_started = 0usize;
-    let mut intervals: Vec<(u32, u32, usize, &'static str)> = Vec::new();
-    let mut run_start: Option<(u32, u32, usize, &'static str)> = None;
-    for &t in &samples {
-        let ai = frame_at(&refd.frames, t);
-        let bi = frame_at(&candd.frames, t);
-        let kind = match (ai, bi) {
-            (None, _) | (_, None) => "not_started",
-            (Some(a), Some(b)) => {
-                let fa = &refd.frames[a];
-                let fb = &candd.frames[b];
-                if fa.hash == fb.hash {
-                    "identical"
-                } else if fa.is_clear() != fb.is_clear() {
-                    "presence"
-                } else if fa.opaque == fb.opaque && fa.bbox == fb.bbox {
-                    // 像素集合一模一样，只有颜色值不同：工具链间 ±1 的 YCbCr
-                    // 舍入差，不是画面错位，也不该算成时序问题。
-                    "color_only"
-                } else {
-                    "frame_mismatch"
-                }
-            }
-        };
-        match kind {
-            "identical" => tl_identical += 1,
-            "presence" => tl_presence += 1,
-            "color_only" => tl_color += 1,
-            "frame_mismatch" => tl_frame += 1,
-            _ => tl_not_started += 1,
-        }
-        let mismatch = kind == "presence" || kind == "frame_mismatch";
-        if mismatch {
-            match &mut run_start {
-                Some(r) => {
-                    r.1 = t;
-                    r.2 += 1;
-                    if r.3 != kind {
-                        r.3 = "mixed";
-                    }
-                }
-                None => run_start = Some((t, t, 1, kind)),
-            }
-        } else if let Some(r) = run_start.take() {
-            intervals.push(r);
-        }
-    }
-    if let Some(r) = run_start.take() {
-        intervals.push(r);
-    }
-    let timeline_verdict = if tl_presence == 0 && tl_frame == 0 && tl_color == 0 && tl_not_started == 0 {
-        "identical"
-    } else if tl_frame > 0 {
-        "shifted"
-    } else if tl_presence > 0 {
-        "presence_diff"
-    } else {
-        "color_only"
-    };
+    // ---- 轨道 2：名义时间轴 + 硬解有效时间轴 --------------------------
+    let tl = sample_timeline(refd, candd, false);
+    let eff = sample_timeline(refd, candd, true);
+    let decode_risk = !refd.decode_feasible() || !candd.decode_feasible();
     let timeline_ok = {
         let a0 = refd.frames.first().map(|f| f.pts).unwrap_or(0);
         let b0 = candd.frames.first().map(|f| f.pts).unwrap_or(0);
@@ -539,13 +595,16 @@ fn compare_pair(
     };
 
     // ---- 综合 ---------------------------------------------------------
-    // 内容优先：画面编错了就是 divergent。内容无损但时间轴不一致，单独标成
-    // content_ok_time_shift —— 这正是真机播放验证要重点复核的那一类。
+    // 内容优先：画面编错了就是 divergent。解码不可行时名义时间轴已不足以
+    // 描述真机，单独标 decode_risk 并给出 effective 轨。内容无损但时间轴
+    // 不一致 → content_ok_time_shift，是真机验证要重点复核的那一类。
     // 只有真正的错位 / 存在性差异 / 按序号的 PTS 平移才算「时间轴不一致」；
     // color_only 只是工具链间的颜色舍入，不影响播放时序结论。
-    let tl_shift = pts_shifted > 0 || tl_frame > 0 || tl_presence > 0;
+    let tl_shift = pts_shifted > 0 || tl.frame_mismatch > 0 || tl.presence > 0;
     let verdict = if content_verdict == "divergent" {
         "divergent"
+    } else if decode_risk {
+        "decode_risk"
     } else if content_verdict == "identical" && !tl_shift {
         "identical"
     } else if !tl_shift {
@@ -572,29 +631,42 @@ fn compare_pair(
         "timeline": {
             "ref_frames": refd.frames.len(),
             "cand_frames": candd.frames.len(),
-            "sample_points": samples.len(),
+            "sample_points": tl.sample_points,
             "ref_first_pts": refd.frames.first().map(|f| f.pts).unwrap_or(0),
             "cand_first_pts": candd.frames.first().map(|f| f.pts).unwrap_or(0),
             "ref_last_pts": refd.frames.last().map(|f| f.pts).unwrap_or(0),
             "cand_last_pts": candd.frames.last().map(|f| f.pts).unwrap_or(0),
             "ok": timeline_ok,
             "tol_ticks": tol_ticks,
-            "identical": tl_identical,
-            "presence_mismatch": tl_presence,
-            "color_only": tl_color,
-            "frame_mismatch": tl_frame,
-            "not_started": tl_not_started,
-            "verdict": timeline_verdict,
+            "identical": tl.identical,
+            "presence_mismatch": tl.presence,
+            "color_only": tl.color_only,
+            "frame_mismatch": tl.frame_mismatch,
+            "not_started": tl.not_started,
+            "verdict": tl.verdict,
             "pts_delta": {
                 "max_ticks": pts_delta_max,
                 "mean_ticks": if n > 0 { (pts_delta_sum as f64 / n as f64 * 100.0).round() / 100.0 } else { 0.0 },
                 "shifted_frames": pts_shifted,
             },
-            "mismatch_intervals": intervals.iter().take(MAX_INTERVALS).map(|&(a, b, n, k)| json!({
-                "start_pts": a, "end_pts": b, "start": clock(a), "end": clock(b),
-                "samples": n, "kind": k,
-            })).collect::<Vec<_>>(),
-            "mismatch_intervals_total": intervals.len(),
+            "decode": {
+                "ref": decode_brief(refd),
+                "cand": decode_brief(candd),
+                "risk": decode_risk,
+            },
+            "effective": {
+                "sample_points": eff.sample_points,
+                "identical": eff.identical,
+                "presence_mismatch": eff.presence,
+                "color_only": eff.color_only,
+                "frame_mismatch": eff.frame_mismatch,
+                "not_started": eff.not_started,
+                "verdict": eff.verdict,
+                "mismatch_intervals": intervals_json(&eff),
+                "mismatch_intervals_total": eff.intervals.len(),
+            },
+            "mismatch_intervals": intervals_json(&tl),
+            "mismatch_intervals_total": tl.intervals.len(),
         },
     });
     Ok(PairResult { value, verdict: verdict.to_string() })
@@ -668,7 +740,8 @@ fn source_check(
 
 fn severity(v: &str) -> u8 {
     match v {
-        "divergent" => 3,
+        "divergent" => 4,
+        "decode_risk" => 3,
         "content_ok_time_shift" => 2,
         "equivalent" => 1,
         _ => 0,
@@ -717,7 +790,7 @@ pub fn run(o: &Options) -> Result<Value, String> {
         }
         let p = &r.value;
         lines.push(format!(
-            "[{}] {} · 内容 {}/{} 帧一致（等价 {} / 实质差异 {}）· 时序 {}（采样 {}，存在性 {} / 错位 {} / 颜色舍入 {}）· PTS 偏移最大 {} tick · 起止 {}",
+            "[{}] {} · 内容 {}/{} 帧一致（等价 {} / 实质差异 {}）· 时序 {}（采样 {}，存在性 {} / 错位 {} / 颜色舍入 {}）· PTS 偏移最大 {} tick · 解码 {}（late 参考 {} / 候选 {}，RX 峰值 {} KB，有效轨 {}）· 起止 {}",
             r.verdict,
             name,
             p["content"]["identical_frames"].as_u64().unwrap_or(0),
@@ -730,6 +803,11 @@ pub fn run(o: &Options) -> Result<Value, String> {
             p["timeline"]["frame_mismatch"].as_u64().unwrap_or(0),
             p["timeline"]["color_only"].as_u64().unwrap_or(0),
             p["timeline"]["pts_delta"]["max_ticks"].as_u64().unwrap_or(0),
+            if p["timeline"]["decode"]["risk"].as_bool().unwrap_or(false) { "有风险" } else { "可行" },
+            p["timeline"]["decode"]["ref"]["late_display_sets"].as_u64().unwrap_or(0),
+            p["timeline"]["decode"]["cand"]["late_display_sets"].as_u64().unwrap_or(0),
+            (p["timeline"]["decode"]["cand"]["rx_peak_bytes"].as_u64().unwrap_or(0) + 1023) / 1024,
+            p["timeline"]["effective"]["verdict"].as_str().unwrap_or(""),
             if p["timeline"]["ok"].as_bool().unwrap_or(false) { "一致" } else { "不一致" },
         ));
         pairs.push(r.value);
@@ -781,7 +859,7 @@ pub fn run(o: &Options) -> Result<Value, String> {
 
     Ok(json!({
         "ok": true,
-        "engine": "supfast baseline 1",
+        "engine": "supfast baseline 2",
         "params": {
             "fps": fps, "tol_frames": o.tol_frames, "tol_ticks": tol_ticks,
             "color_tol": o.color_tol, "ratio_tol": o.ratio_tol,
@@ -823,28 +901,30 @@ mod tests {
         assert_eq!(d.max_delta, 2);
     }
 
+    fn mkf(pts: u32, present: u32, opaque: usize, nref: usize) -> pgsdec::FrameMeta {
+        pgsdec::FrameMeta {
+            pts, dts: pts.saturating_sub(10), present_pts: present, decode_ticks: 10,
+            late_ticks: present.saturating_sub(pts), ds_bytes: 100, obj_pixels: 0,
+            clipped_pixels: 0, cropped: false, state: 0x80, pal_upd: false, nref,
+            comp_no: 0, hash: 0, opaque, bbox: [0, 0, 1, 1],
+            undefined_refs: 0, undefined_pal: 0,
+        }
+    }
+
     #[test]
     fn frame_at_picks_last_not_after() {
         let fs = vec![
-            pgsdec::FrameMeta { pts: 10, state: 0x80, pal_upd: false, nref: 1, comp_no: 0,
-                hash: 0, opaque: 1, bbox: [0,0,1,1], undefined_refs: 0, undefined_pal: 0 },
-            pgsdec::FrameMeta { pts: 20, state: 0, pal_upd: false, nref: 0, comp_no: 1,
-                hash: 0, opaque: 0, bbox: [0,0,0,0], undefined_refs: 0, undefined_pal: 0 },
+            mkf(10, 10, 1, 1),
+            mkf(20, 20, 0, 0),
         ];
         assert_eq!(frame_at(&fs, 5), None);
         assert_eq!(frame_at(&fs, 10), Some(0));
         assert_eq!(frame_at(&fs, 19), Some(0));
         assert_eq!(frame_at(&fs, 20), Some(1));
         assert_eq!(frame_at(&fs, 999), Some(1));
+        assert_eq!(frame_at_ex(&fs, 19, true), Some(0));
+        assert_eq!(frame_at_ex(&fs, 20, true), Some(1));
     }
 
-    #[test]
-    fn png_roundtrip_has_valid_signature() {
-        let p = std::env::temp_dir().join("supfast_baseline_png.png");
-        write_rgba_png(&p, 2, 1, &[255, 0, 0, 255, 0, 255, 0, 128]).unwrap();
-        let d = fs::read(&p).unwrap();
-        assert_eq!(&d[..8], b"\x89PNG\r\n\x1a\n");
-        assert_eq!(&d[12..16], b"IHDR");
-        let _ = fs::remove_file(&p);
-    }
+
 }
