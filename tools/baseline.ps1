@@ -10,10 +10,14 @@
     4. 导出黄金帧清单（每帧 PTS / hash / bbox）与参考画面 PNG，供真机录屏对照。
 
   判据：identical（两轨都一致）/ content_ok_time_shift（内容无损、时间轴有平移）/
-        equivalent（内容仅颜色舍入差异）/ divergent（内容帧有实质差异）。
+        equivalent（内容仅颜色舍入差异）/ decode_risk（存在 late 显示集或缓冲超限）/
+        divergent（内容帧有实质差异）。
 
   脚本不重新渲染字幕，直接用 test\ 下已有的 SUP + XML + PNG，因此结果可复现、
   不受 avs2bdnxml 环境影响。要重产物请先跑 convert / --engine pgs。
+  test2 / drama 的参考流是「默认流时序合规化」后的新默认产物 `<名>.retime.sup`
+  （`supfast.exe --engine convert ...` 生成 `<名>\<名>.sup` 后重命名即可），
+  同目录的 `<名>.sup` 是合规化前的旧默认流，作为 `default-old` 候选做 A/B。
 
 .PARAMETER Exe
   supfast.exe 路径，默认 <项目根>\dist\supfast.exe（先跑 build.bat）。
@@ -78,22 +82,24 @@ function Get-SampleDef([string]$name) {
         }
         'test2' {
             return @{
-                Ref = Join-Path $root 'test2\test2.sup'
+                Ref = Join-Path $root 'test2\test2.retime.sup'
                 Xml = Join-Path $root 'test2\test2.xml'
                 Cands = @(
                     @{ N = 'native-final'; P = Join-Path $root 'test2\test2.fixed.sup' },
                     @{ N = 'native-stage1'; P = Join-Path $root 'pgs_e2e\test2\test2.native.sup' },
-                    @{ N = 'avs2bdnxml-ref'; P = Join-Path $root 'out_ref3\ref3.sup' }
+                    @{ N = 'avs2bdnxml-ref'; P = Join-Path $root 'out_ref3\ref3.sup' },
+                    @{ N = 'default-old'; P = Join-Path $root 'test2\test2.sup' }
                 )
             }
         }
         'drama' {
             return @{
-                Ref = Join-Path $root 'drama\drama.sup'
+                Ref = Join-Path $root 'drama\drama.retime.sup'
                 Xml = Join-Path $root 'drama\drama.xml'
                 Cands = @(
                     @{ N = 'native-final';  P = Join-Path $root 'drama\drama.timing.sup' },
-                    @{ N = 'native-stage1'; P = Join-Path $root 'drama\drama.native.sup' }
+                    @{ N = 'native-stage1'; P = Join-Path $root 'drama\drama.native.sup' },
+                    @{ N = 'default-old';   P = Join-Path $root 'drama\drama.sup' }
                 )
             }
         }
@@ -174,8 +180,9 @@ $summary += ''
 $summary += '解码列来自硬解模型：段按 DTS 进 RX buffer，RLE 解码受 Rd=16e6 px/s、清屏/合成受 Rc=32e6 px/s 限制，'
 $summary += ' `present_pts = max(pts, dts + need)`；有效轨即基于 present_pts 重新采样的时间轴。'
 $summary += ''
-$summary += '源头对拍（--xml）按事件序号对齐，PTS 差只作参考：拼段流的 PTS 经 sup_retime'
-$summary += ' 重映射，与 BDN InTC 本来就不在同一基准上。'
+$summary += '源头对拍（--xml）按事件序号对齐，PTS 差只作参考：默认拼段流的 PTS 由 sup_retime'
+$summary += ' 按分段原始 PCS PTS 重映射，并受「新 epoch 的 DTS 必须晚于上一 epoch 最后呈现」约束，'
+$summary += ' 与 BDN InTC 仍可能有小幅平移，本来就不在同一基准上。'
 $summary += ''
 $summary += '真机对照：跑 tools\compare_recording.bat，传 --Frames <本轮 *.frames.json> --Recording <录屏>，'
 $summary += ' 工具按 present_pts 用 ffmpeg 抽帧、裁到同一 bbox 逐像素比对，并导出差异热图与 JSON 判定。'

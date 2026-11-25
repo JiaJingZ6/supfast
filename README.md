@@ -95,27 +95,28 @@ DTS、并保证 PCS 的 PTS 跨段不倒退；转换收尾再**只读**体检一
 display set buffering 提前解码，不能只看单个显示集的 `PTS−DTS`。早期版本把这两项
 列为警告，会误伤 SUPer 自己判定 compliant 的流（下面的三方校准就是这么发现的）。
 
-> 实测对照（三方校准）：
+> 实测对照（三方校准，2026-11 默认流时序合规化后）：
 > - 原版 `avs2bdnxml` 单跑产出的 `ref.sup`：0 错误 0 警告；
 > - supfast 默认拼段流：`drama.ass`（1832 段 / 10961 个 PGS 段）**0 错误 0 警告、严格合规**；
->   `test2.ass` 0 错误 2 警告（`WDS_CHANGED` / `PTS_DUP`）—— 来自「每段独立 epoch、
->   相邻段区间偶有 1 帧重叠」，属拼接链路固有现象，多数播放器容忍；
+>   `test2.ass` 0 错误 1 警告（`WDS_CHANGED` 22 处）—— 来自「每段独立 epoch、
+>   相邻段窗口定义偶有变化」，属拼接链路固有现象，多数播放器容忍；`PTS_DUP` 已消除；
 > - **SUPer 重新编码的 `.super.sup`：0 错误 0 警告、严格合规** —— 用权威编码器反向
 >   验证这套规则没有误伤合规流。
->
 > - **Rust 原生整流流 `.native.sup`：0 错误 0 警告、严格合规**，且首个 ODS 解码后
 >   与源 PNG 逐像素一致 —— `test2.ass` 上顺带把体积从 3.37 MB 压到 1.32 MB。
 >
-> 早先会报的 `PTS_EQ_DTS` / `DTS_NOT_MONO` / `TIGHT_DECODE` / `PTS_BACK` 已在
-> `sup_retime` 里修掉：同一显示集内各段共用呈现时刻，DTS = PTS − 按分辨率算出的解码
-> 提前量（全片统一，随 PTS 单调），起点落在上一段末尾之前的段整体平移一帧。
-> 要把剩下的 `WDS_CHANGED` / `PTS_DUP` 也消除，打开下面的 Rust 原生 PGS（内置、推荐）
-> 或 SUPer 后端即可。
+> 早先会报的 `PTS_EQ_DTS` / `DTS_NOT_MONO` / `TIGHT_DECODE` / `PTS_BACK` / `PTS_DUP`
+> 已在 `sup_retime` 里修掉：默认拼段流从 2026-11 起与原生整流流共用同一套段时序
+> 模板（同一显示集所有段 DTS = `PTS − lead`，PDS / END 的 `PTS = DTS`，见
+> [段时序合规](#段时序合规与-super-verifier-对拍)），SUPer `check_pts_dts_sanity`
+> 对 test2 / drama 默认流均由 `False` 变为 `True`。要把剩下的 `WDS_CHANGED` 也消除，
+> 打开下面的 Rust 原生 PGS（内置、推荐）或 SUPer 后端即可。
 
 ## Rust 原生 PGS（内置 · 推荐）
 
-默认 `.sup` 是「每段一个 epoch、逐段拼接」的产物，快，但相邻段各自带完整 WDS/PCS，
-`test2.ass` 上会留 `WDS_CHANGED` / `PTS_DUP` 两个警告。想要**严格合规**又不想装 Python，
+默认 `.sup` 是「每段一个 epoch、逐段拼接」的产物，快；2026-11 起已做段时序合规化
+（SUPer `check_pts_dts_sanity` 通过），但相邻段各自带完整 WDS/PCS，`test2.ass` 上
+仍会留 `WDS_CHANGED` 一个警告。想要**严格合规**又不想装 Python，
 在「高级选项 → Rust 原生 PGS」打开开关：supfast 自带的编码器把主 `.xml` + 索引 PNG
 一次性规划成一条流，额外产出 `<字幕名>.native.sup`，不覆盖默认产物、不改变 PNG。
 
@@ -137,7 +138,7 @@ SUP 从 3.37 MB 降到 1.23 MB；`drama.ass` 的图几乎张张不同，体积�
 
 | 样本 | 默认拼段流 | SUPer 重编码 | Rust 原生 PGS |
 |---|---|---|---|
-| `test2.ass` | 3.37 MB / 0 错 2 警 | 3.42 MB / 0 错 0 警 | **1.32 MB / 0 错 0 警** |
+| `test2.ass` | 3.37 MB / 0 错 1 警 | 3.42 MB / 0 错 0 警 | **1.32 MB / 0 错 0 警** |
 | `drama.ass` | 42.27 MB / 0 错 0 警 | 43.07 MB / 0 错 0 警 | **42.18 MB / 0 错 0 警** |
 
 不需要 `avs2bdnxml` 的 SUP 输出、不需要 Python / SUPer；只多一个纯 Rust 的 `flate2`
@@ -233,8 +234,35 @@ ODS（DTS 更早）之间就造成段 DTS 回退。现在按 `ref.sup` 的排布
 
 实测四个样本（合成淡入链 / 合成拆分链 / `test2` / `drama`）的 SUPer
 `is_compliant` 均为 `(True, 0)`、`check_pts_dts_sanity` 均为 `True`，内置自检同样
-0 错 0 警，逐像素解码比对 0 误差。**默认拼段流仍沿用 `DTS=0` 惯例**，见
-[已知限制](#已知限制)。
+0 错 0 警，逐像素解码比对 0 误差。
+
+#### 默认拼段流也已时序合规化（2026-11）
+
+默认 `<名>.sup` 是各段 `avs2bdnxml` 输出经 `sup_retime` 重映射 PTS 拼起来的。
+早期它沿用 `avs2bdnxml` 惯例：PCS 的 `DTS = PTS`（lead=0）、PDS 写 `0xFFFF…`
+哨兵 PTS、PDS / END 写 `DTS=0`，SUPer `check_pts_dts_sanity` 直接判 out of spec，
+第二版硬解模型里 test2 174 个 / drama 2430 个显示集全部来不及解码。现在
+`sup_retime` 与 `src/pgs.rs` 共用上表这套模板：
+
+- 所有段 DTS 统一 `base = ds_pts − lead`，`lead = wipe + 一帧`（1080p 为 9587），
+  PDS / END 的 `PTS = DTS = base`，彻底覆盖哨兵 PTS 与 `DTS=0`；
+- 呈现时刻不再按 PCS 序号推（`avs2bdnxml` 会去重，序号 ≠ 真实帧号），改为读取
+  分段原始 PCS 的 PTS 作为「段内帧偏移」再加段起始 ticks，与 BDN `InTC` 对齐；
+- 跨段只在会踩「新 epoch 的 DTS 必须晚于上一 epoch 最后呈现」时整段推到
+  `floor + lead + 1`；段内 PCS 严格递增，同刻「显示 + 清屏」推后一帧消掉 `PTS_DUP`。
+
+实测（新二进制重新 `convert` 生成，产物与旧实现字节数相同）：
+
+| 默认流 | 内置自检 | SUPer `check_pts_dts_sanity` | SUPer `is_compliant` | 源头 PTS 最大偏差 |
+|---|---|---|---|---|
+| `test2` | 0 错 1 警（`WDS_CHANGED` 22 处），`dts_back=0` / `pts_back=0` / `tight_ds=0`，`PTS_DUP` 已消除 | `False → True` | `(False, 0)` | 108847 → **17516 tick（1.21 s → 0.195 s）** |
+| `drama` | 0 错 0 警、严格合规 | `False → True` | `(True, 0)` | 562 → 13595 tick（0.151 s，合规约束下的取舍） |
+
+`test2` 的 `is_compliant` 仍为 `(False, 0)`，但诊断后确认与时序无关：失败项全部是
+`avs2bdnxml` 分段输出固有的 `Window change mid-epoch` / `Object-slot dimensions
+mismatch` / `Object ID … is reserved` 结构性错误，改前改后 verifier 日志行数同为
+48，且时序相关日志从 221 行降为 0。要连这些结构错误一起消除，用
+[Rust 原生 PGS](#rust-原生-pgs内置--推荐) 或 SUPer 后端重编码即可。
 
 **暂不支持**（后续阶段）：窗口布局优化，以及 SUPer 那种带 SSIM 容差的帧间合成
 （有损，本项目坚持零画质损失）。另外，单个显示集超过 1 MiB 会直接报错而不是产出
@@ -296,7 +324,10 @@ tools\compare_recording.bat -Frames frames.json -Recording rec.mp4 -OffsetMs 100
 23.976）、`--tol`（时间轴容差帧数，默认 1）、`--color-tol`（逐通道容差，默认 2）、
 `--ratio-tol`（超容差像素占比上限，默认 0.005）、`--frames`（黄金帧清单 JSON）、
 `--png-dir` + `--max-png`（导出 bbox 裁出的 RGBA 参考画面）、`--json`（完整报告）。
-一键脚本的结果落在 `tools\baseline-results\`：`<时间戳>_<样本>.json`、
+一键脚本把 `test2` / `drama` 的参考流指向时序合规化后的新默认产物 `<名>.retime.sup`
+（用 `--engine convert` 生成 `<名>\<名>.sup` 后重命名），并把合规化前的旧默认流
+`<名>.sup` 作为 `default-old` 候选做 A/B；缺任一文件会打印 `[SKIP]` 而不是报错。
+结果落在 `tools\baseline-results\`：`<时间戳>_<样本>.json`、
 `<时间戳>_<样本>.frames.json`、`<时间戳>_<样本>.png\`，以及 `<时间戳>_summary.md`。
 
 `compare` 的参数：`--frames`（帧清单）、`--recording`（录屏，ffmpeg 能读的任何格式）、
@@ -314,34 +345,43 @@ DTS 单调性）；`pairs[]` 分 `content` / `timeline` 两段，`timeline` 内�
 与 `effective`（基于 `present_pts` 的有效时间轴）；`source.checks[]` 是源头对拍；
 `golden.frames[]` 每帧含 PTS、`present_pts`、`late_ticks`、hash、bbox 与参考 PNG 名。
 
-实测（2026-11-25，第二版，四组样本 / 9 条候选，整轮约 129 秒）：
+实测（2026-11-25，默认流时序合规化后重跑；四组样本 / 11 条候选，整轮约 136 秒。
+参考流换成新默认产物 `*.retime.sup`，并额外把旧默认流作为 `default-old` 候选做 A/B）：
 
 | 样本 | 参考 → 候选 | 内容轨 | 名义 / 有效时间轴 | late 显示集（ref / cand） | 综合 | 源头对拍 |
 |---|---|---|---|---|---|---|
 | fade | 渐变关 → 渐变开 / 最终 | 8/8 帧一致 | identical / identical | 0 / 0 | `identical` | 8/8 逐像素一致，Δ=0 |
 | split | 拆分关 → 拆分开 / 最终 | 8/8 帧一致 | identical / identical | 0 / 0 | `identical` | 8/8 逐像素一致，Δ=0 |
-| test2 | 拼段 → 原生最终 / 阶段一 | 129 帧：73 全一致 + 56 帧 Δ=1，**0 实质差异** | shifted / shifted | 174 / 0 | `decode_risk` | 原生 129/129 逐像素一致（Δ=0、PTS 差 0） |
-| test2 | 拼段 → avs2bdnxml 原版 | 129/129 完全一致 | shifted / shifted | 174 / 64 | `decode_risk` | 73/129 完全一致（56 帧 Δ=1） |
-| drama | 拼段 → 原生最终 / 阶段一 | 1832 帧：3 全一致 + 1829 帧 Δ=1，**0 实质差异** | shifted / shifted | 2430 / 1 或 0 | `decode_risk` | 原生 1832/1832 逐像素一致（Δ=0、PTS 差 0） |
+| test2 | 新默认 → 原生最终 / 阶段一 | 129 帧：73 全一致 + 56 帧 Δ=1，**0 实质差异** | shifted / shifted | 0 / 0 | `content_ok_time_shift` | 原生 129/129 逐像素一致（Δ=0、PTS 差 0） |
+| test2 | 新默认 → avs2bdnxml 原版 | 129/129 完全一致 | shifted / shifted | 0 / 64 | `decode_risk` | 73/129 完全一致（56 帧 Δ=1） |
+| test2 | 新默认 → 旧默认 | 129/129 完全一致 | shifted / shifted | 0 / 174 | `decode_risk` | 73/129 完全一致（56 帧 Δ=1） |
+| drama | 新默认 → 原生阶段一 | 1832 帧：3 全一致 + 1829 帧 Δ=1，**0 实质差异** | shifted / shifted | 0 / 0 | `content_ok_time_shift` | 原生 1832/1832 逐像素一致（Δ=0、PTS 差 0） |
+| drama | 新默认 → 原生最终 | 同上 | shifted / shifted | 0 / 1 | `decode_risk` | 同上 |
+| drama | 新默认 → 旧默认 | 1832/1832 完全一致 | shifted / shifted | 0 / 2430 | `decode_risk` | 3/1832 完全一致（1829 帧 Δ=1） |
 
 四条结论：
 
 - **画面无损**：原生整流流（含调色板渐变、帧间对象拆分）与源 PNG 逐像素一致；
-  与拼段流的唯一差异是 ±1 的 RGB→YCbCr 舍入（两套矩阵 / 取整口径），PSNR ≈ 77 dB。
+  与拼段流的唯一差异是 ±1 的 RGB→YCbCr 舍入（两套矩阵 / 取整口径），PSNR 71–82 dB。
   fade / split 合成样本两条时间轴全 `identical`，说明两条优化链在解码器模型下与
   逐帧 ODS 完全等价 —— 不是「只拿源 PNG 自证」，而是跨编码策略的独立验证。
-- **解码可行性分化（第二版新发现）**：参考流是旧拼段产物，实测 **所有 PCS 的
-  `DTS = PTS`（lead=0）**，PDS 带 `0xFFFF…` 哨兵 PTS、`DTS=0`，因此 test2 的
-  174 个、drama 的 2430 个显示集在硬解模型下全都来不及解码（最大 late 954 /
-  1879 tick）；原生整流流统一 `lead=9587`、PDS/END 用 `base`，late 为 0
-  （drama 最终版有 1 个显示集余量不足，阶段一为 0，是后续可优化点）。
-  avs2bdnxml 原版介于两者之间（test2 有 64 个 late）。这比 PTS 平移严重得多，
-  也是「原生实现可取代外部 SUPer 后端 / 设为默认」的一条硬证据。
-- **时间轴口径不同**：`sup_retime` 按段单调化，原生编码器按 BDN `InTC` 规划
-  （`mono_times`），拼段流还少补清屏显示集。源头对拍里原生流与源 PTS 差为 0，
-  拼段流 `test2` 最大偏 1.21 秒、`drama` 最大偏 562 tick。有效时间轴轨与名义轨
-  结论一致（都 `shifted`），说明这不是解码来不及造成的假象，而是真实的规划差异；
-  `timeline.mismatch_intervals` 逐段列出，就是真机上该重点复核的时间点。
+- **默认流的硬解风险已消除**：旧默认流所有 PCS 的 `DTS = PTS`（lead=0）、PDS 带
+  `0xFFFF…` 哨兵 PTS、`DTS=0`，硬解模型下 test2 174 个 / drama 2430 个显示集全部
+  late。新默认流统一 `lead = 9587`、PDS / END 写 `base = PTS − lead` 且
+  `PTS = DTS`，**参考流自身 late = 0**：test2 与两条原生流对拍从 `decode_risk`
+  降为 `content_ok_time_shift`，drama 与阶段一原生流同样降为 `content_ok_time_shift`。
+  上表剩下的 `decode_risk` 都来自**候选流**（旧默认 / avs2bdnxml 原版 / 原生最终版
+  那 1 个余量不足的显示集），不再是默认产物的问题。SUPer
+  `check_pts_dts_sanity` 对 test2 / drama 默认流也都由 `False` 变 `True`。
+- **时间轴口径不同，且合规化有代价**：`sup_retime` 呈现时刻现取分段原始 PCS PTS
+  （见 [段时序合规](#段时序合规与-super-verifier-对拍)），原生编码器按 BDN `InTC`
+  规划（`mono_times`）。源头对拍里原生流与源 PTS 差为 0；默认流 `test2` 最大偏
+  **17516 tick / 0.195 s**（旧实现 108847 tick / 1.21 s，改善约 6 倍），但 `drama`
+  从旧实现的 562 tick 升到 13595 tick / 0.151 s —— 这是 PGS 硬约束「新 epoch 的 DTS
+  必须晚于上一 epoch 最后呈现」在密集连续段上必须整段推后造成的，是拿「可解码」
+  换「绝对对齐」的取舍，不是画面编错。有效时间轴轨与名义轨结论一致（都
+  `shifted`），说明这不是解码来不及造成的假象；`timeline.mismatch_intervals`
+  逐段列出，就是真机上该重点复核的时间点。
 - **第三角已可复现**：`--engine compare` + `tools\compare_recording.bat` 把录屏对照
   做成命令。用基线导出的参考画面合成一张「理想录屏」做端到端探针，1 帧 466 个
   参与比对的像素逐通道一致（`identical`），ffmpeg 抽帧 / PNG 读回 / bbox 裁剪 /
@@ -364,7 +404,8 @@ DTS 单调性）；`pairs[]` 分 `content` / `timeline` 两段，`timeline` 内�
 
 `cubicibo/SUPer`（GPL-3.0-or-later）是完整的 HDMV PGS 编码器，吃 BDN XML + PNG，
 生成**严格合规**、支持卡拉OK / 遮罩 / 淡入淡出 / 移动的 SUP。supfast 默认走
-「逐段 avs2bdnxml + 拼接」，快但不做解码器时序优化；两者可以并存。
+「逐段 avs2bdnxml + 拼接」，快，2026-11 起也做了段时序合规化；但分段输出仍会留下
+窗口定义变化等结构性警告，SUPer 与内置 Rust 原生 PGS 才能产出零警告整流流。三者可以并存。
 
 supfast **不随包分发 SUPer**：GPL 与约 100 MB 的 Python 运行时都不允许塞进这个
 3 MB 的包。需要你自行安装，然后在「高级选项 → SUPer 高质量 PGS」打开开关、填路径。
@@ -394,7 +435,7 @@ H://DIY//SUPer-cli//venv//Scripts//python.exe -m pip install "SUPer @ git+https:
 | `<字幕名>.super.log` | SUPer 的完整输出日志 |
 
 两套 SUP 都会在日志页各跑一次合规自检，并给出一行对比。
-实测 `test2.ass`：默认拼段流 0 错 2 警，**SUPer 那份 0 错 0 警、严格合规**。
+实测 `test2.ass`：默认拼段流 0 错 1 警（时序已合规），**SUPer 那份 0 错 0 警、严格合规**。
 
 ### 已知限制
 
@@ -589,19 +630,20 @@ tools\winbox.exe min "Google Chrome"    :: 截图前把挡在前面的窗口最�
 - **SUPer 不随包分发**：可选的「高质量 PGS」后端需要自行安装 GPL-3.0 的 SUPer，
   见 [SUPer 高质量 PGS（可选）](#super-高质量-pgs可选)。内置的
   [Rust 原生 PGS](#rust-原生-pgs内置--推荐) 不需要它，已带无损的调色板渐变与帧间对象拆分。
-- **原生整流流的时序分歧已解决**：早期版本把 PDS / END 的 DTS 写 0（沿用拼段工具链
-  惯例），SUPer 的 `check_pts_dts_sanity` 会判 PTS-DTS out of spec。现在同一显示集所有段
-  共用一个 DTS、PDS / END 的 PTS 也取该值，提前量收紧到 `(wipe, 2·wipe]`，epoch 只在
-  显示集级空档 > lead 处切分，逐帧连续的大窗口 Acquisition 省略 WDS 并降级 Normal Case。
-  实测四个样本（渐变链 / 拆分链 / test2 / drama）SUPer 的 `is_compliant` 均为
-  `(True, 0)`、`check_pts_dts_sanity` 均为 `True`，内置自检同样 0 错 0 警。
-  详见 [Rust 原生 PGS](#rust-原生-pgs内置--推荐)。
-- **默认拼段流仍沿用 DTS=0 惯例，且有硬解风险**：默认 `<名>.sup` 是 avs2bdnxml 各段
-  输出经 `sup_retime` 重映射 PTS 拼起来的，不是整流流；实测 PCS 的 `DTS = PTS`
-  （lead=0），PDS / END 仍写 `DTS=0`、PDS 带 `0xFFFF…` 哨兵 PTS。SUPer 的
-  `check_pts_dts_sanity` 判 out of spec，第二版硬解模型进一步定量：test2 的 174 个、
-  drama 的 2430 个显示集全部来不及在名义 PTS 前完成解码（最大 late 954 / 1879 tick）。
-  内置自检对此做了豁免；需要合规且解码可行的整流流请勾
+- **段时序分歧已解决，两条工具链统一**：早期把 PDS / END 的 DTS 写 0（沿用拼段
+  工具链惯例），SUPer 的 `check_pts_dts_sanity` 会判 PTS-DTS out of spec。现在
+  `sup_retime`（默认拼段流）与 `src/pgs.rs`（原生整流流）都用同一套模板：同一显示集
+  所有段共用一个 `DTS = PTS − lead`、PDS / END 的 PTS 也取该值，提前量收紧到
+  `(wipe, 2·wipe]`（1080p 为 9587）。四个原生样本 SUPer `is_compliant` 均为
+  `(True, 0)`；test2 / drama 默认流 `check_pts_dts_sanity` 也都由 `False` 变 `True`。
+  详见 [段时序合规](#段时序合规与-super-verifier-对拍)。
+- **默认拼段流仍不是「严格合规」的整流流**：时序已合规、硬解模型下 late 显示集
+  从 174 / 2430 降到 0，但 `avs2bdnxml` 分段输出本身还有结构性错误 —— `test2` 上
+  SUPer `is_compliant=(False, 0)`，失败项是 `Window change mid-epoch` /
+  `Object-slot dimensions mismatch` 等，内置自检表现为 1 个 `WDS_CHANGED` 警告。
+  另外受 PGS 硬约束「新 epoch 的 DTS 必须晚于上一 epoch 最后呈现」，密集连续段会
+  被整段推后，源头 PTS 相对 BDN `InTC` 仍有最大 0.195 s（test2）/ 0.151 s（drama）
+  的残留平移。需要零警告、零平移的整流流请勾
   [Rust 原生 PGS](#rust-原生-pgs内置--推荐)，对照数据见
   [对拍基准](#真机播放验证前置对拍基准)。
 - 无边框窗口用 `data-tauri-drag-region` 拖动，**双击标题栏不会最大化**，用右上角按钮。

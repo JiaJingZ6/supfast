@@ -483,20 +483,25 @@ fn fps_str(fps: f64) -> String {
 // 段头固定 13 字节：'PG'(2) + PTS(4) + DTS(4) + type(1) + size(2)，90 kHz 时钟。
 // 一个「显示集」以 PCS(0x16) 开头、END(0x80) 收尾，中间是 WDS(0x17)/PDS(0x14)/ODS(0x15)。
 //
-// 解码器模型（HDMV PGS，见 SUPer doc/codec.md）：
-//   * PCS 的 PTS = 这组画面的呈现时刻；同一显示集内各段共用它。
-//   * DTS = 解码器开始接收这组数据的时刻，必须 < PTS 且全局严格单调，
-//     提前量要够 epoch start 清全屏、解码 RLE 对象、合成窗口（Rd / Rc）。
-//   * PDS / END 的 DTS 写 0 = 「不适用」；PDS 的 PTS 是 avs2bdnxml 的哨兵值，保持原样。
+// 段时序按 HDMV PGS / SUPer `check_pts_dts_sanity` 的硬约束排布，与
+// `src/pgs.rs` 的原生整流流共用同一套模板：
+//   * 同一显示集所有段共用一个 DTS = base = PTS − lead；
+//   * PCS / WDS / ODS 的 PTS 取呈现时刻，PDS / END 的 PTS 也取 base
+//     （规范强制 dts == pts；avs2bdnxml 的 0xFFFF… 哨兵 PTS 与 DTS=0 必须去掉，
+//      SUPer 会把哨兵读成负时间戳，令整条流的 DTS 序列崩掉）；
+//   * lead = wipe + 一帧，落在 (wipe, 2·wipe] 内（wipe = 全屏面积·90k/Rc），
+//     且 < 1 秒：既满足 epoch start 的 PTS−DTS > wipe，也不踩 WDS 的 2·wipe 红线。
+//     旧实现取「清屏 + 整屏解码 + 合成」最坏上界 21250 ticks，反而超了 2·wipe。
 //
-// 早先这里把每个段的 PTS、DTS 都写成同一个值（ODS 还早一帧），等于抹掉了 DTS<PTS；
-// 拼接处又会出现 PCS PTS 倒退。现在按解码器模型重新推导一套：
-//   ① 跨段维护 PTS 下限，起点落在上一段末尾之前的整段平移（保住段内字幕时长）；
-//   ② 按分辨率算出「整屏对象」的保守解码提前量 lead，DTS = PTS − lead 随 PTS 单调；
-//   ③ 同一显示集内各段共用 PTS / DTS。
-// lead 只由分辨率决定（对整片是常量），所以每段独立算出来的值必然相同；取统一值而非
-// 逐组精算，是为了避免「前一组提前量大、后一组 PTS 只晚一帧」时 DTS 反而回退 ——
-// 那正是 DTS_NOT_MONO 的来源。
+// 呈现时刻不再按 PCS 序号推（avs2bdnxml 会去重，序号 ≠ 真实帧号，曾让部分
+// 显示集比 BDN InTC 早 1.21 秒）：动态段直接读原始 PCS 段头的 PTS，它就是
+// 「段内帧偏移 × frame_ticks」，加上段起始 ticks 即全局呈现时刻；静态段渲 2 帧、
+// 尾部清屏要落在段末 real_frames，仍按原逻辑推。
+//
+// 跨段只在真会破坏约束时平移：`floor` 记住上一段最后一个 PCS 的 PTS，新段首个
+// 显示集必须满足 `first − lead > floor`（epoch start 的 DTS 要晚于上一 epoch 的
+// 最后呈现），否则整段推到该下限；其余段边界有远大于 lead 的空档，保持 InTC
+// 原值不动。段内 PCS 严格递增，同刻的「显示 + 清屏」推后一帧，消掉 PTS_DUP。
 
 fn sup_retime(
     data: &[u8],
@@ -508,13 +513,15 @@ fn sup_retime(
     floor: &mut u32, // 入：上一段最后一个 PCS 的 PTS；出：本段最后一个 PCS 的 PTS
 ) -> Result<Vec<u8>, String> {
     let frame_ticks = PGS_HZ / fps;
+    let frame_ticks_u = frame_ticks.round().max(1.0) as u32;
     let statics = comp_frames != real_frames;
 
-    // 拆段：只记区间，不复制字节（整片 42 MB 的 SUP 少走两趟内存）
+    // 拆段：只记区间与原始 PTS，不复制字节（整片 42 MB 的 SUP 少走两趟内存）
     struct Seg {
         typ: u8,
         s: usize,
         e: usize,
+        raw_pts: u32,
     }
     let mut segs: Vec<Seg> = Vec::new();
     let mut i = 0usize;
@@ -527,15 +534,15 @@ fn sup_retime(
         let size = ((data[i + 11] as usize) << 8) | (data[i + 12] as usize);
         let end = i + 13 + size;
         if end > data.len() {
-            // 以前这里静默 break，剩下的字节直接丢掉，产出的 .sup 尾巴缺失，
-            // 播放器上表现为最后一段字幕不显示。宁可报错让调用方指出是哪一段。
+            // 静默 break 会丢掉尾部字节，播放器上表现为最后一段字幕不显示。
             return Err(format!(
                 "SUP 被截断：段头声明 {} 字节负载，实际只剩 {}",
                 size,
                 data.len().saturating_sub(i + 13)
             ));
         }
-        segs.push(Seg { typ, s: i, e: end });
+        let raw_pts = u32::from_be_bytes([data[i + 2], data[i + 3], data[i + 4], data[i + 5]]);
+        segs.push(Seg { typ, s: i, e: end, raw_pts });
         i = end;
     }
     if i < data.len() && data[i..].starts_with(b"PG") {
@@ -545,9 +552,8 @@ fn sup_retime(
         return Ok(data.to_vec());
     }
 
-    // 静态段渲的是 2 帧，尾部自带一个「清屏 epoch」。若下一段正好从这段结尾开始，
-    // 这个清屏和下一段的显示是同一时间戳 —— 原版不会有它（直接换 PCS 就行）。
-    // 丢掉它省一条 41 字节的冗余 epoch，也让 PCS 数和原版一致。
+    // 静态段渲 2 帧，尾部自带清屏 epoch；与下一段紧贴时丢掉，省一条冗余 epoch，
+    // 也避免和下一段的显示集撞在同一时间戳。
     if drop_tail && statics {
         let ps: Vec<usize> = segs
             .iter()
@@ -567,48 +573,25 @@ fn sup_retime(
         .map(|(k, _)| k)
         .collect();
 
-    // 每个 PCS 应携带的真实帧（浮点，便于算 PTS）
-    let mut pcs_time: Vec<f64> = Vec::with_capacity(pcs_idx.len());
-    for (n, _) in pcs_idx.iter().enumerate() {
-        if statics {
-            pcs_time.push(if n == 0 {
-                real_start as f64
-            } else {
-                (real_start + real_frames) as f64
-            });
+    // ---------- ① 呈现时刻：与 BDN InTC 对齐 ----------
+    let start_ticks = (real_start as f64 * frame_ticks).round().max(0.0) as u32;
+    let end_ticks = ((real_start + real_frames) as f64 * frame_ticks).round().max(0.0) as u32;
+    let mut pcs_pts: Vec<u32> = Vec::with_capacity(pcs_idx.len());
+    for (n, &si) in pcs_idx.iter().enumerate() {
+        pcs_pts.push(if statics {
+            if n == 0 { start_ticks } else { end_ticks }
         } else {
-            pcs_time.push(real_start as f64 + n as f64);
-        }
-    }
-
-    let ts = |frame: f64| -> u32 { (frame.max(0.0) * frame_ticks).round() as u32 };
-
-    // ---------- ① 呈现时刻：修掉跨段 PTS 倒退 ----------
-    // pcs_time 按段内 PCS 序号推出来；相邻两段的区间偶尔会重叠一帧（test2 里
-    // part#39 末尾 PCS 在 13704955、part#40 起点却在 13701201，正好倒退一帧），
-    // 于是下一段第一个显示集比上一段最后一个还早。floor 记住上一段最后一个
-    // PCS 的 PTS；起点低于它就整段平移，而不是只抬越界的那一帧 —— 后者会把段内
-    // 相邻显示集挤到同一时刻，白白吃掉一帧字幕时长。平移不改变段内相对间隔。
-    let mut pcs_pts: Vec<u32> = pcs_time.iter().map(|&f| ts(f)).collect();
-    if let Some(&first) = pcs_pts.first() {
-        if first < *floor {
-            let shift = *floor - first;
-            for p in &mut pcs_pts {
-                *p = p.saturating_add(shift);
-            }
-        }
-    }
-    if let Some(&last) = pcs_pts.last() {
-        *floor = last;
+            // avs2bdnxml 把段内帧偏移直接写进 PCS 的 PTS（0, 53, 96 … 与子 XML
+            // 的 InTC 同源）。只取 PCS：WDS/PDS/ODS 的 PTS 是解码时刻或 0xFFFF…
+            // 哨兵，不能当呈现时刻。
+            start_ticks.saturating_add(segs[si].raw_pts)
+        });
     }
 
     // ---------- ② 解码提前量 lead ----------
-    // 取「最坏情况」保守上界：epoch start 清全屏、整屏大小的 RLE 对象解码、
-    // 整屏窗口合成。任何显示集的 need = max(clear, decode) + compose 都 <= lead，
-    // 自检的 TIGHT_DECODE 不会误报；且 lead 只由分辨率决定，全片每段一致。
-    //   clear = 90000*plane/Rc, decode = 90000*plane/Rd, compose = 90000*plane/Rc
-    //   decode >= clear，故 need 上界 = 90000*plane/Rd + 90000*plane/Rc
-    const RD: f64 = 16e6;
+    // SUPer check_pts_dts_sanity：epoch start 要 PTS−DTS > wipe（全屏擦除），
+    // WDS 要 PTS−DTS <= 2·wipe，所有段 PTS−DTS < 1 秒。取 wipe + 一帧，
+    // 1080p 为 5832 + 3754 + 1 = 9587 ticks，稳稳落在 (wipe, 2·wipe] 内。
     const RC: f64 = 32e6;
     let plane = segs
         .iter()
@@ -618,44 +601,64 @@ fn sup_retime(
             (u16::from_be_bytes([p[0], p[1]]) as u64) * (u16::from_be_bytes([p[2], p[3]]) as u64)
         })
         .unwrap_or(1920 * 1080);
-    let worst = (PGS_HZ * plane as f64 / RD + PGS_HZ * plane as f64 / RC).ceil() as u32;
-    // 多留一帧余量；PTS−DTS 超过 1 秒同样不合规，夹在上限内
-    let lead = (worst.saturating_add(frame_ticks as u32 + 1)).clamp(1, 89_999);
+    let wipe = (PGS_HZ * plane as f64 / RC).ceil() as u32;
+    let lead = (wipe.saturating_add(frame_ticks_u + 1)).clamp(1, 89_999);
 
-    // ---------- ③ 写入 ----------
-    // 同一显示集内 PCS / WDS / ODS 共用呈现时刻与解码时刻；END 的 DTS=0（不适用），
-    // PDS 整段保持 avs2bdnxml 原样（PTS 哨兵 + DTS=0）。
+    // ---------- ③ 跨段 / 段内单调化 ----------
+    // epoch start 的 DTS = first − lead 必须 > 上一 epoch 最后呈现时刻 floor。
+    // 只在真的踩线时把整段推到下限（保住段内相对间隔），其余段保持 InTC 原值。
+    if let Some(&first) = pcs_pts.first() {
+        let lower = floor.saturating_add(lead).saturating_add(1);
+        if first < lower {
+            let shift = lower - first;
+            for p in &mut pcs_pts {
+                *p = p.saturating_add(shift);
+            }
+        }
+    }
+    // 段内严格递增；同刻的「显示 + 清屏」推后一帧，消掉 PTS_DUP 与
+    // 「wds_gap > pts_delta」在 gap=0 处的失败。
+    for k in 1..pcs_pts.len() {
+        let min = pcs_pts[k - 1].saturating_add(frame_ticks_u);
+        if pcs_pts[k] < min {
+            pcs_pts[k] = min;
+        }
+    }
+    if let Some(&last) = pcs_pts.last() {
+        *floor = last;
+    }
+
+    // ---------- ④ 写入 ----------
+    // 与 src/pgs.rs 相同：DTS 全段 = base，PCS/WDS/ODS 的 PTS = 呈现时刻，
+    // PDS/END 的 PTS 也 = base。avs2bdnxml 原产物的 PDS 哨兵 PTS / DTS=0
+    // 在这里被彻底覆盖。
     let mut pi = 0usize;
     let mut ds_pts = pcs_pts.first().copied().unwrap_or(0);
-    let mut ds_dts = ds_pts.saturating_sub(lead).max(1);
+    let mut base = ds_pts.saturating_sub(lead).max(1);
     let mut out: Vec<u8> = Vec::with_capacity(data.len());
     for s in &segs {
-        let base = out.len();
+        let b = out.len();
         out.extend_from_slice(&data[s.s..s.e]);
         match s.typ {
             0x16 => {
                 if pi < pcs_pts.len() {
                     ds_pts = pcs_pts[pi];
-                    ds_dts = ds_pts.saturating_sub(lead).max(1);
+                    base = ds_pts.saturating_sub(lead).max(1);
                 }
                 pi += 1;
-                let pts = ds_pts.to_be_bytes();
-                let dts = ds_dts.to_be_bytes();
-                out[base + 2..base + 6].copy_from_slice(&pts);
-                out[base + 6..base + 10].copy_from_slice(&dts);
+                out[b + 2..b + 6].copy_from_slice(&ds_pts.to_be_bytes());
+                out[b + 6..b + 10].copy_from_slice(&base.to_be_bytes());
             }
             0x17 | 0x15 => {
-                let pts = ds_pts.to_be_bytes();
-                let dts = ds_dts.to_be_bytes();
-                out[base + 2..base + 6].copy_from_slice(&pts);
-                out[base + 6..base + 10].copy_from_slice(&dts);
+                out[b + 2..b + 6].copy_from_slice(&ds_pts.to_be_bytes());
+                out[b + 6..b + 10].copy_from_slice(&base.to_be_bytes());
             }
-            0x80 => {
-                let pts = ds_pts.to_be_bytes();
-                out[base + 2..base + 6].copy_from_slice(&pts);
-                out[base + 6..base + 10].copy_from_slice(&[0; 4]);
+            0x14 | 0x80 => {
+                // PDS / END 规范强制 pts == dts；写 base 同时消掉哨兵与 DTS=0。
+                out[b + 2..b + 6].copy_from_slice(&base.to_be_bytes());
+                out[b + 6..b + 10].copy_from_slice(&base.to_be_bytes());
             }
-            _ => {} // PDS 原样
+            _ => {}
         }
     }
     Ok(out)
@@ -1784,4 +1787,180 @@ pub fn probe_env(mod_root: Option<&str>, super_cmd: &str) -> Value {
              }},
         ],
     })
+}
+// ---------------------------------------------------------------------------
+// 单测：默认拼段流的时序重映射
+// ---------------------------------------------------------------------------
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const PCS: u8 = 0x16;
+    const WDS: u8 = 0x17;
+    const PDS: u8 = 0x14;
+    const ODS: u8 = 0x15;
+    const END: u8 = 0x80;
+
+    fn seg(typ: u8, pts: u32, dts: u32, payload: &[u8]) -> Vec<u8> {
+        let mut v = Vec::with_capacity(13 + payload.len());
+        v.extend_from_slice(b"PG");
+        v.extend_from_slice(&pts.to_be_bytes());
+        v.extend_from_slice(&dts.to_be_bytes());
+        v.push(typ);
+        v.extend_from_slice(&(payload.len() as u16).to_be_bytes());
+        v.extend_from_slice(payload);
+        v
+    }
+
+    /// 最小 PCS：1920x1080 / 23.976 / comp_no=0 / state / nref
+    fn pcs(raw_pts: u32, state: u8, nref: u8) -> Vec<u8> {
+        let mut p = vec![0x07, 0x80, 0x04, 0x38, 0x20, 0x00, 0x00, state, 0x00, 0x00, nref];
+        p.extend_from_slice(&[0u8; 8]); // 一个 composition object
+        seg(PCS, raw_pts, 0xFFFF_FFFFu32 - 5967, &p)
+    }
+
+    fn wds(raw_pts: u32) -> Vec<u8> {
+        let p = [1u8, 0u8, 0x02, 0x78, 0x03, 0xB6, 0x02, 0x8E, 0x00, 0x49];
+        seg(WDS, raw_pts, 0, &p)
+    }
+
+    fn pds_sentinel() -> Vec<u8> {
+        // avs2bdnxml 的 PDS：PTS 是 0xFFFF… 哨兵，DTS=0
+        seg(PDS, 0xFFFF_FFFFu32 - 5966, 0, &[0u8, 0u8, 0u8, 16, 128, 128, 255])
+    }
+
+    fn ods(raw_pts: u32) -> Vec<u8> {
+        let p = [0u8, 0u8, 0u8, 0x80, 0, 0, 0, 0, 8, 0, 8, 1, 0, 0, 0];
+        seg(ODS, raw_pts, 0xFFFF_FFFFu32 - 5967, &p)
+    }
+
+    fn end(raw_pts: u32) -> Vec<u8> {
+        seg(END, raw_pts, 0, &[])
+    }
+
+    fn dynamic_sup(raw: &[u32]) -> Vec<u8> {
+        let mut v = Vec::new();
+        for (k, &t) in raw.iter().enumerate() {
+            let state = if k == 0 { 0x80 } else if k + 1 == raw.len() { 0x00 } else { 0x40 };
+            let nref = if k + 1 == raw.len() { 0 } else { 1 };
+            v.extend_from_slice(&pcs(t, state, nref));
+            v.extend_from_slice(&wds(t));
+            if nref > 0 {
+                v.extend_from_slice(&pds_sentinel());
+                v.extend_from_slice(&ods(t));
+            }
+            v.extend_from_slice(&end(t));
+        }
+        v
+    }
+
+    /// 解析输出，返回 (类型, PTS, DTS) 序列
+    fn parse(v: &[u8]) -> Vec<(u8, u32, u32)> {
+        let mut out = Vec::new();
+        let mut i = 0usize;
+        while i + 13 <= v.len() {
+            if &v[i..i + 2] != b"PG" { i += 1; continue; }
+            let typ = v[i + 10];
+            let sz = ((v[i + 11] as usize) << 8) | v[i + 12] as usize;
+            out.push((
+                typ,
+                u32::from_be_bytes([v[i + 2], v[i + 3], v[i + 4], v[i + 5]]),
+                u32::from_be_bytes([v[i + 6], v[i + 7], v[i + 8], v[i + 9]]),
+            ));
+            i += 13 + sz;
+        }
+        out
+    }
+
+    #[test]
+    fn retime_uses_raw_pcs_pts_not_sequence_index() {
+        // 一个动态段：avs2bdnxml 去重后只在段内帧 0 / 53 / 96 输出显示集。
+        // 旧实现按 PCS 序号推（0/1/2 帧），会把第 2、3 张字幕提前 50+ 帧。
+        let ft = 90000.0f64 / 23.976;
+        let start = (144.0 * ft).round() as u32;
+        let raw = [0u32, 198949, 360360];
+        let mut floor = 0u32;
+        let out = sup_retime(&dynamic_sup(&raw), 23.976, 144, 97, 97, false, &mut floor).unwrap();
+        let segs = parse(&out);
+        let p: Vec<u32> = segs.iter().filter(|x| x.0 == PCS).map(|x| x.1).collect();
+        assert_eq!(p, vec![start, start + 198949, start + 360360],
+            "PCS PTS 必须来自原始段头的段内帧偏移，而非 PCS 序号");
+        assert_eq!(floor, start + 360360);
+    }
+
+    #[test]
+    fn retime_writes_compliant_template_and_kills_sentinels() {
+        let ft = 90000.0f64 / 23.976;
+        let start = (144.0 * ft).round() as u32;
+        let mut floor = 0u32;
+        let out = sup_retime(&dynamic_sup(&[0, 198949]), 23.976, 144, 97, 97, false, &mut floor).unwrap();
+        let segs = parse(&out);
+        let ds: Vec<_> = segs.iter().filter(|x| x.0 != 0x16 || x.1 == start).take(5).copied().collect();
+        let pts0 = ds[0].1;
+        let base = ds[0].2;
+        assert_eq!(pts0, start);
+        assert!(base > 0, "PCS DTS 不能是 0");
+        assert_eq!(pts0 - base, 9587, "lead 应为 wipe(5832) + 一帧(3754) + 1");
+        // 同一显示集所有段共用 DTS
+        for x in &ds { assert_eq!(x.2, base, "段 {} 的 DTS 应统一为 base", x.0); }
+        // PCS / WDS / ODS 的 PTS 是呈现时刻；PDS / END 的 PTS = DTS = base
+        for x in &ds {
+            match x.0 {
+                PCS | WDS | ODS => assert_eq!(x.1, pts0),
+                PDS | END => { assert_eq!(x.1, base); assert_eq!(x.2, base); }
+                _ => {}
+            }
+        }
+        // 整条流不应再出现 0xFFFF… 哨兵 PTS 或 DTS=0
+        for x in &segs {
+            assert!(x.1 < 0xFFF0_0000, "PDS 哨兵 PTS 未清除：{}", x.1);
+            assert!(x.2 > 0, "DTS=0 未清除");
+        }
+    }
+
+    #[test]
+    fn retime_static_tail_uses_real_frames() {
+        let ft = 90000.0f64 / 23.976;
+        let start = (144.0 * ft).round() as u32;
+        let end_ticks = ((144 + 53) as f64 * ft).round() as u32;
+        let mut v = Vec::new();
+        v.extend_from_slice(&pcs(0, 0x80, 1));
+        v.extend_from_slice(&wds(0));
+        v.extend_from_slice(&pds_sentinel());
+        v.extend_from_slice(&ods(0));
+        v.extend_from_slice(&end(0));
+        v.extend_from_slice(&pcs(3754, 0x00, 0));
+        v.extend_from_slice(&wds(3754));
+        v.extend_from_slice(&end(3754));
+        let mut floor = 0u32;
+        let out = sup_retime(&v, 23.976, 144, 2, 53, false, &mut floor).unwrap();
+        let p: Vec<u32> = parse(&out).iter().filter(|x| x.0 == PCS).map(|x| x.1).collect();
+        assert_eq!(p, vec![start, end_ticks], "静态段尾部清屏应落在段末 real_frames");
+    }
+
+    #[test]
+    fn retime_shifts_only_when_epoch_start_would_be_early() {
+        let ft = 90000.0f64 / 23.976;
+        let start = (144.0 * ft).round() as u32;
+        let raw = dynamic_sup(&[0, 198949]);
+        // 上一段最后呈现时刻远早于本段：不平移，保持 InTC 原值
+        let mut floor = start - 200_000;
+        let a = sup_retime(&raw, 23.976, 144, 97, 97, false, &mut floor).unwrap();
+        assert_eq!(parse(&a)[0].1, start);
+        // 上一段最后呈现时刻紧贴本段：必须整段推到 floor + lead + 1
+        let mut floor2 = start;
+        let b = sup_retime(&raw, 23.976, 144, 97, 97, false, &mut floor2).unwrap();
+        let pb: Vec<u32> = parse(&b).iter().filter(|x| x.0 == PCS).map(|x| x.1).collect();
+        assert_eq!(pb[0], start + 9587 + 1);
+        assert_eq!(pb[1] - pb[0], 198949, "整段平移不改变段内相对间隔");
+    }
+
+    #[test]
+    fn retime_dedups_same_instant_display_sets() {
+        let raw = dynamic_sup(&[0, 0]);
+        let mut floor = 0u32;
+        let out = sup_retime(&raw, 23.976, 144, 97, 97, false, &mut floor).unwrap();
+        let p: Vec<u32> = parse(&out).iter().filter(|x| x.0 == PCS).map(|x| x.1).collect();
+        assert_eq!(p[1] - p[0], 3754, "同刻的显示集要推后一帧，PTS 严格递增");
+    }
 }

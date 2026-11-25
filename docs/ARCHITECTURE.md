@@ -195,7 +195,7 @@ engine.rs 是纯函数式引擎，不依赖 `tauri::*`，只依赖 `serde_json` 
 | ASS 解析 | [`parse_ass()`](file:///H:/DIY/rea_sup/tauri/src/engine.rs#L261-L333) | 读 `[Script Info]` 的 PlayResX/Y、Timer；按 `Format:` 动态定位 Dialogue 字段；`split_n` 保证 Text 里的逗号不被切开 |
 | 切段 | [`build_segments()`](file:///H:/DIY/rea_sup/tauri/src/engine.rs#L357-L425) | 见 5.2 |
 | AVS 生成 | [`avs_for_segment()`](file:///H:/DIY/rea_sup/tauri/src/engine.rs#L435-L468) | 每段一个脚本：`LoadPlugin` + `MaskSubMod` + `LanczosResize`，再按静态/动态 `Trim` |
-| SUP 重定时 | [`sup_retime()`](file:///H:/DIY/rea_sup/tauri/src/engine.rs#L490-L604) | 改写 PGS 段头 PTS/DTS，见 5.4 |
+| SUP 重定时 | [`sup_retime()`](file:///H:/DIY/rea_sup/tauri/src/engine.rs#L506-L665) | 改写 PGS 段头 PTS/DTS 为合规模板，见 5.4 |
 | 路径 | `strip_verbatim`、`resolve_outdir` | 去掉 `\\?\` 前缀；统一 `<父目录>\<字幕名>\` 布局 |
 | 工具定位 | `find_exe`、[`locate_exe()`](file:///H:/DIY/rea_sup/tauri/src/engine.rs#L838-L858) | 优先级：设置里的 mod_root → `SUPFAST_MOD` → exe 同级/`mod\` → 当前目录 → 两个硬编码开发路径 |
 | 参数归一 | `pick_f64/pick_u32/pick_flag/pick_str`、`read_opts` | 前端传字符串或数字都能吃；fps 限制 1~240，jobs 限制 1~64，分辨率上限 8192 |
@@ -232,16 +232,43 @@ engine.rs 是纯函数式引擎，不依赖 `tauri::*`，只依赖 `serde_json` 
 
 `run_seg()` 与 `kill_tree()` 放在同一区块，负责超时/取消时杀**进程树**，以及给 `CreateProcess` 加 `CREATE_NO_WINDOW`。不加这个标志，Windows 会为每个子进程分配 conhost，整片从 102 秒拖到 270 秒且闪窗。
 
-### 5.4 PGS 时间戳重映射
+### 5.4 PGS 时间戳重映射（时序合规模板）
 
-每段的 `seg.sup` 是在“从 0 开始”的局部时间轴上生成的，必须改回真实时间：
+每段的 `seg.sup` 是在“从 0 开始”的局部时间轴上生成的，必须改回真实时间。2026-11 起
+`sup_retime` 与 `src/pgs.rs` 用**同一套合规模板**（见 5.6 末段），默认拼段流不再
+沿用 `avs2bdnxml` 的 `DTS=0` / PDS 哨兵 PTS 惯例：
 
-- PGS 段头固定 13 字节：`PG` + PTS(4) + DTS(4) + type(1) + size(2)。
-- `PCS(0x16)` 与 `WDS(0x17)`、`END(0x80)` 用当前 PCS 时间；`ODS(0x15)` 比 PCS 早一帧；`PDS(0x14)` 不动。
-- 静态段只渲了 2 帧，尾部会带一个清屏 epoch；若下一段紧接其后（`contig`），丢掉这个尾部 epoch，保证 PCS 数和原版一致。
-- 时间换算 `ticks = frame * 90000 / fps`。
+| 段 | PTS | DTS |
+|---|---|---|
+| `PCS(0x16)` / `WDS(0x17)` / `ODS(0x15)` | 显示集呈现时刻 `ds_pts` | `base = ds_pts − lead` |
+| `PDS(0x14)` / `END(0x80)` | `base` | `base`（规范强制 `dts == pts`） |
 
-比“整段重编码”省内存：只记录区间索引，再逐段拷贝并改写 8 个字节。
+- PGS 段头固定 13 字节：`PG` + PTS(4) + DTS(4) + type(1) + size(2)，90 kHz。
+- **呈现时刻取原始 PCS 的 PTS**：`avs2bdnxml` 把「段内帧偏移 × frame_ticks」直接写进
+  PCS（0 / 198949 / 360360 … 与子 XML 的 `InTC` 同源），`start_ticks + raw_pts` 即全局
+  呈现时刻。旧实现用 `real_start + PCS 序号` 推时间，但分段输出会去重、序号 ≠ 真实帧号，
+  曾让部分显示集比 BDN `InTC` 早 **1.21 秒**。静态段仍渲 2 帧、尾部清屏落在
+  `real_frames` 对应的 `end_ticks`。
+- **lead 按分辨率算**：`wipe = 90000 · width · height / Rc`（Rc = 32e6 px/s），
+  `lead = wipe + frame_ticks + 1`，1080p/23.976 为 `5832 + 3754 + 1 = 9587` ticks，
+  落在 `(wipe, 2·wipe]` 内且 < 1 秒：既满足 Epoch Start 的 `PTS−DTS > wipe`，也不踩
+  WDS 的 `2·wipe` 红线。旧实现取「清屏 + 整屏解码 + 合成」最坏上界 21250 ticks，
+  反而越线。
+- **跨段单调化**：`floor` 记住上一段最后一个 PCS 的 PTS，新段首个显示集必须满足
+  `first − lead > floor`（新 epoch 的 DTS 要晚于上一 epoch 最后呈现），否则整段推到
+  `floor + lead + 1`（保住段内相对间隔）；其余段边界空档远大于 lead，保持 `InTC` 原值。
+  段内 PCS 严格递增，同刻「显示 + 清屏」推后一帧，消掉 `PTS_DUP` 与 `wds_gap > pts_delta`
+  在 gap=0 处的失败。这条硬约束是源头 PTS 仍有约 0.195 s 残留平移的原因（旧实现 1.21 s）。
+- 静态段只渲了 2 帧，尾部会带一个清屏 epoch；若下一段紧接其后（`contig`），丢掉这个
+  尾部 epoch，保证 PCS 数和原版一致。时间换算 `ticks = frame · 90000 / fps`。
+- 写入时 `PDS` 的 `0xFFFF…` 哨兵 PTS 与 `DTS=0`、`END` 的 `DTS=0` 全部被覆盖；
+  SUPer 会把哨兵读成负时间戳，令整条流的 DTS 序列崩掉。
+
+比“整段重编码”省内存：只记录区间索引，再逐段拷贝并改写 8 个字节。实测 SUPer
+`check_pts_dts_sanity` 对 test2 / drama 默认流都由 `False` 变为 `True`；`is_compliant`
+对 test2 仍为 `(False, 0)`，但原因已定位为 `avs2bdnxml` 分段输出固有的
+`Window change mid-epoch` / `Object-slot dimensions mismatch` 结构性错误，改前改后
+日志行数同为 48，与时序无关（要消除需换用原生整流流）。
 
 ### 5.5 环境自检
 
@@ -308,8 +335,9 @@ Normal Case 不清空对象缓冲、且允许同集定义新对象，才能合�
   也取 `base`（其 `PDS.__init__` / `END.__init__` 强制 `dts=pts`），于是段 DTS 序列
   全程非递减。`lead = wipe + 一帧`（1080p 为 9587），同时满足 Epoch Start 的
   `PTS−DTS > wipe` 与 WDS 的 `PTS−DTS <= 2·wipe`；阶段一按「清屏+解码+合成最坏上界」
-  取的 21251 会踩 WDS 红线。**不要**把 PDS/END 的 DTS 写回 0 —— 拼段流
-  (`sup_retime`) 仍用这套惯例，但整流流写 0 会被 SUPer 判 out of spec。
+  取的 21251 会踩 WDS 红线。**不要**把 PDS/END 的 DTS 写回 0 —— 2026-11 起
+  `sup_retime` 也改用同一模板（见 5.4），两条工具链统一；`src/verify.rs` 仍保留对
+  `dts=0` / PDS 哨兵 PTS 的豁免，只为兼容历史流与外部导入的旧 `avs2bdnxml` 产物。
 - `group_epochs` 的切分空档必须用**显示集级**口径：上一 epoch 最后一个显示集的 PTS
   在有空档时是清屏显示集（= prev_out），无清屏时是事件显示集（= prev_in）。
   早期用 `in − prev_out` 会偏小，误把合法边界合并成超 64 id / 4 MiB 的过大 epoch。
@@ -383,7 +411,9 @@ Normal Case 不清空对象缓冲、且允许同集定义新对象，才能合�
 
 `--xml` 另做源头对拍：复用 `pgs.rs` 的 `parse_bdn` / `decode_png` / `palette_entries`，
 把每个事件的源 PNG 组合成期望画面，按事件序号与各流的可见帧对齐。源头对拍按序号，
-PTS 差只作参考 —— 拼段流的 PTS 经 `sup_retime` 重映射，与 BDN `InTC` 不在同一基准。
+PTS 差只作参考 —— 默认拼段流的呈现时刻由 `sup_retime` 取分段原始 PCS PTS 重映射
+（见 5.4），已贴近 BDN `InTC`，但受「新 epoch 的 DTS 必须晚于上一 epoch 最后呈现」
+约束仍会有约 0.2 s 以内的残留平移，不是完全同一基准。
 
 ### 5.8 真机录屏对照（src/compare.rs / src/pngutil.rs）
 
